@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KytyPS5 Studio</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="pre">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <linearGradient id="cg-P" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f6fcff"/><stop offset="1" stop-color="#78c2ff"/></linearGradient>
+  <linearGradient id="cg-G" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff0a8"/><stop offset="1" stop-color="#e0a000"/></linearGradient>
+  <linearGradient id="cg-S" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f7f9fc"/><stop offset="1" stop-color="#8c97a8"/></linearGradient>
+  <linearGradient id="cg-B" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f6c08a"/><stop offset="1" stop-color="#a4561a"/></linearGradient>
+</defs></svg>
+<div id="bg"><div id="artbox"></div><div id="bg-shade"></div></div>
+
+<div id="boot">
+  <div class="scene"><div class="glow g1"></div><div class="glow g2"></div><div class="glow g3"></div><canvas id="boot-canvas"></canvas></div>
+  <div id="start">
+    <div id="ring"><i class="pulse"></i><i class="pulse p2"></i><div class="disc"><img src="logo.svg" alt="" draggable="false"></div></div>
+    <div id="start-sub">Press <i class="glyph">✕</i> or Enter</div></div>
+</div>
+
+<header id="top">
+  <nav id="tabs">
+    <button class="tab" data-tab="games" data-f>Games</button>
+  </nav>
+  <div id="status">
+    <div id="pad"></div>
+    <div id="fork-chip"></div>
+    <button class="round" id="btn-trophy" data-f title="Trophies"><span class="cup G"></span></button>
+    <button class="round" id="btn-gear" data-f title="Settings">⚙</button>
+    <button class="round" id="btn-power" data-f title="Exit">⏻</button>
+    <button id="avatar" data-f data-key="avatar" title="Profile"></button>
+    <div id="clock"></div>
+  </div>
+</header>
+
+<main id="screen"></main>
+
+<div id="osk"></div>
+<div id="toasts"></div>
+<div id="cc"></div>
+<aside id="panel"><div id="panel-body"></div></aside>
+<div id="scrim"></div>
+<div id="overlay"></div>
+
+<footer id="hints">
+  <span><i class="glyph">✕</i> Select</span>
+  <span><i class="glyph">○</i> Back</span>
+  <span><i class="glyph opt">≡</i> Options</span>
+  <span><i class="glyph">L1</i><i class="glyph">R1</i> Switch tab</span>
+</footer>
+
+<script>window.STUDIO_TOKEN = "__TOKEN__";</script>
+<script src="app.js"></script>
+</body>
+</html>

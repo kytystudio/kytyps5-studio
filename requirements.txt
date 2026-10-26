@@ -1,0 +1,4 @@
+# the app itself uses only the Python standard library; the native window needs pywebview
+pywebview>=6.0
+# only to build the .exe
+pyinstaller>=6.0

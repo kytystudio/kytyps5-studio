@@ -1,0 +1,13 @@
+# user data: saves, trophies, downloaded emulators, logs, settings, community files
+data/
+# build output
+dist/
+installer/
+build/
+__pycache__/
+*.spec
+# never publish patch files, catalogs with patch files or game data by accident
+*.zar
+*.pkg
+*.dds
+PPSA*.json
