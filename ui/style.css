@@ -362,3 +362,5 @@ body.insettings #bg{background:radial-gradient(55% 75% at 6% -5%,rgba(205,210,22
 #tabs,#status{pointer-events:auto}
 
 #ring .disc img{width:7.4rem;height:7.4rem;filter:drop-shadow(0 0 1.2rem rgba(255,255,255,.35));margin-top:.4rem}
+
+#panel .odesc{font-size:1.5rem;line-height:1.4;color:var(--ink3);margin:-.2rem 1.6rem 1.2rem;font-weight:300}

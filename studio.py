@@ -238,14 +238,85 @@ def current_meta(fork):
     return read_meta(d) if (d / EXE_NAME).exists() else None
 
 
-def probe_flags(exe):
+def help_text(exe):
     try:
-        out = subprocess.run([str(exe), "--help"], capture_output=True, text=True, timeout=15,
-                             cwd=str(exe.parent), creationflags=0x08000000).stdout
-        flags = sorted(set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]+", out)))
-        return flags if "--game" in flags else None
+        return subprocess.run([str(exe), "--help"], capture_output=True, text=True, timeout=15,
+                              cwd=str(exe.parent), creationflags=0x08000000).stdout
     except Exception:
-        return None
+        return ""
+
+
+def probe_flags(exe):
+    flags = sorted(set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]+", help_text(exe))))
+    return flags if "--game" in flags else None
+
+
+# Flags Studio already drives from its own settings; the generic fork settings never repeat them.
+MANAGED_FLAGS = {"--game", "--game-patch", "--screen-width", "--screen-height", "--user-name", "--user-id",
+                 "--present-mode", "--gpu", "--fullscreen", "--hdr", "--hide-cursor", "--no-splash", "--amd-cpu",
+                 "--shader-cache", "--trophy-notifications", "--no-trophy-notifications", "--trophy-duration",
+                 "--addcont-dir", "--addcont", "--keymap", "--help"}
+DEBUG_WORDS = ("validation", "dump", "profile", "debug", "log", "printf", "readback", "sync", "rd", "spirv")
+_OPT_LINE = re.compile(r"^ {1,6}(--[a-z][a-z0-9-]*)(?:\s+(<[^>]*>\S*))?\s+(\S.*)$")
+
+
+def parse_help(out):
+    """Turns a fork's own --help into a list of settings Studio can show without knowing the fork:
+    every flag it documents, its argument kind (switch / on-off / choice / number / text) and its description.
+    A fork with new options (DLSS, frame generation, ...) therefore shows them with no change to Studio."""
+    entries = []
+    for line in out.splitlines():
+        m = _OPT_LINE.match(line)
+        if m:
+            entries.append([m.group(1), m.group(2), m.group(3).strip()])
+        elif entries and line.startswith(" " * 12) and line.strip():
+            entries[-1][2] += " " + line.strip()
+    opts = []
+    for flag, arg, desc in entries:
+        if flag in MANAGED_FLAGS or "repeatable" in desc.lower():
+            continue
+        words = flag[2:].split("-")
+        o = {"flag": flag, "kind": "switch", "desc": desc,
+             "label": flag[2:].replace("-", " ").capitalize(),
+             "group": "Debug" if any(w in DEBUG_WORDS for w in words) else
+                      "Audio" if words[0] in ("audio", "mic") else
+                      "Controller" if words[0] in ("controller", "keyboard") else "Graphics and emulation"}
+        d = re.search(r"Default:\s*([^.()]+?)(?:[.)]|$)", desc)
+        if d:
+            o["default"] = d.group(1).strip()
+        if arg:
+            inner = arg[1:].split(">")[0]
+            if "|" in inner:
+                ch = [c.strip() for c in inner.split("|")]
+                o["kind"] = "bool" if {c.lower() for c in ch} <= {"true", "false", "on", "off", "t", "f"} else "choice"
+                o["choices"] = ch
+            elif inner == "value" and re.match(r"^\w+(, \w+)*,? or \w+\.", desc):  # "Fifo, Mailbox, or Immediate."
+                o["kind"], o["choices"] = "choice", re.split(r",? or |, ", desc.split(".")[0])
+            elif re.fullmatch(r"\d+-\d+", inner):
+                lo, hi = inner.split("-")
+                o.update(kind="num", min=int(lo), max=int(hi))
+            elif inner in ("num", "seconds", "index", "number"):
+                o["kind"] = "num"
+            else:
+                o["kind"] = "text"
+        opts.append(o)
+    order = ["Graphics and emulation", "Audio", "Controller", "Debug"]
+    return sorted(opts, key=lambda o: order.index(o["group"]))
+
+
+def fork_options(fork, meta=None):
+    """The documented options of the installed version; probed once and kept in its .studio.json."""
+    meta = meta or current_meta(fork)
+    if not meta:
+        return []
+    vdir = version_dir(fork, meta["tag"])
+    if meta.get("options") is None:
+        meta["options"] = parse_help(help_text(vdir / EXE_NAME))
+        try:
+            (vdir / ".studio.json").write_text(json.dumps(meta), "utf-8")
+        except OSError:
+            pass
+    return meta["options"]
 
 
 def set_job(job, **kw):
@@ -297,7 +368,7 @@ def install_worker(job, fork, release):
         set_job(job, message="Verifying", progress=0.95)
         meta = {"tag": release["tag"], "name": release["name"], "published": release["published"],
                 "asset": asset["name"], "size": asset["size"], "installedAt": time.time(),
-                "flags": probe_flags(dest / EXE_NAME)}
+                "flags": probe_flags(dest / EXE_NAME), "options": parse_help(help_text(dest / EXE_NAME))}
         (dest / ".studio.json").write_text(json.dumps(meta), "utf-8")
         with lock:
             fork["current"] = release["tag"]
@@ -410,12 +481,182 @@ def scan_games():
 
 # ---------------------------------------------------------------- launch ---
 
+ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def parse_env(text):
+    out = {}
+    for part in re.split(r"[;\r\n]+", str(text)):
+        k, sep, v = part.partition("=")
+        if sep and ENV_KEY.match(k.strip()):
+            out[k.strip()] = v.strip()
+    return out
+
+
+# Features many forks switch with KYTY_* environment variables instead of command-line flags (their own
+# launcher maps its checkboxes to these). The catalog describes them ("settings", shared or per fork); this list is
+# only the fallback used when no catalog has been loaded. A shared entry is offered only for a fork whose preset or
+# README names every variable it needs, so a fork without frame generation never shows it.
+FALLBACK_FEATURES = [
+    {"id": "framegen", "label": "Frame generation", "needs": ["KYTY_FRAMEGEN"], "kind": "choice",
+     "desc": "Extra generated frames. DLSS-G needs an RTX 40/50 card and the Streamline files (see the fork's README); the AMD FSR option works on any GPU.",
+     "choices": [{"label": "Off", "env": {"KYTY_FRAMEGEN": "0"}}, {"label": "2x (DLSS-G)", "env": {"KYTY_FRAMEGEN": "1"}},
+                 {"label": "3x (DLSS-G, RTX 50)", "env": {"KYTY_FRAMEGEN": "2"}},
+                 {"label": "4x (DLSS-G, RTX 50)", "env": {"KYTY_FRAMEGEN": "3"}},
+                 {"label": "2x (AMD FSR 3.1)", "env": {"KYTY_FRAMEGEN": "1", "KYTY_FRAMEGEN_BACKEND": "fsr"}}]},
+    {"id": "upscaler", "label": "Upscaling", "needs": ["KYTY_DLSS", "KYTY_FSR"], "kind": "choice",
+     "desc": "Replaces the game's own anti-aliasing with DLSS (RTX) or FSR 3.1 (any GPU).",
+     "choices": [{"label": "Game's own (TAA)", "env": {"KYTY_DLSS": "0", "KYTY_FSR": "0"}}, {"label": "NVIDIA DLSS", "env": {"KYTY_DLSS": "1", "KYTY_FSR": "0"}},
+                 {"label": "AMD FSR 3.1", "env": {"KYTY_DLSS": "0", "KYTY_FSR": "1"}}]},
+    {"id": "renderres", "label": "Render resolution", "needs": ["KYTY_ASTRO_RENDER_RES"], "kind": "choice",
+     "desc": "The game's 3D resolution (lower is faster).",
+     "choices": [{"label": f"{r}p", "env": {"KYTY_ASTRO_RENDER_RES": str(r)}} for r in (540, 720, 1080, 1368, 1872, 2160)]},
+    {"id": "fpscap", "label": "Frame rate limit", "needs": ["KYTY_FRAMEGEN_FPS_CAP"], "kind": "num", "key": "KYTY_FRAMEGEN_FPS_CAP", "min": 0, "max": 1000,
+     "desc": "With DLSS-G, holds the rendered frames to this rate so generated frames are evenly spaced. Pick one your PC holds. 0 = off."},
+    {"id": "pacing", "label": "Smooth frame pacing", "needs": ["KYTY_PRESENT_ABS_VBLANK"], "kind": "switch", "on": {"KYTY_PRESENT_ABS_VBLANK": "1"}, "off": {"KYTY_PRESENT_ABS_VBLANK": "0"},
+     "desc": "After a slow frame, skip a vblank instead of showing the next frames back to back."},
+    {"id": "relaxed", "label": "Relaxed shader maths", "needs": ["KYTY_FLOAT_PROFILE"], "kind": "switch", "on": {"KYTY_FLOAT_PROFILE": "relaxed"},
+     "desc": "Simpler shader maths: faster, experimental."},
+    {"id": "vram", "label": "Video memory budget (MB)", "needs": ["KYTY_VRAM_BUDGET_MB"], "kind": "num", "key": "KYTY_VRAM_BUDGET_MB", "min": 0, "max": 1000000,
+     "desc": "Leaves video memory free for DLSS-G (helps on 16 GB cards at 4K)."},
+]
+
+
+def documented_env(vdir):
+    """KYTY_* names a build mentions: its preset and the tables in its own README files."""
+    names = {k for k in fork_env(vdir) if k.startswith("KYTY")}
+    for p in list(Path(vdir).glob("*.md"))[:8]:
+        try:
+            names.update(re.findall(r"`(KYTY_[A-Z0-9_]+)", p.read_text("utf-8", "replace")))
+        except OSError:
+            pass
+    return names
+
+
+SAFE_ENV = re.compile(r"^KYTY_[A-Z0-9_]{1,60}$")  # catalog entries may only set the emulator's own variables
+
+
+def clean_feature(d):
+    """One setting definition from a catalog (untrusted JSON) -> a checked copy, or None."""
+    try:
+        kind, fid = d["kind"], str(d["id"])
+        if kind not in ("choice", "num", "switch", "text") or not re.fullmatch(r"[\w:.-]{1,60}", fid):
+            return None
+        env_ok = lambda e: isinstance(e, dict) and 0 < len(e) <= 8 and all(SAFE_ENV.match(str(k)) and isinstance(v, (str, int, float)) for k, v in e.items())
+        out = {"id": fid, "label": _text(d.get("label") or fid, 60), "desc": _text(d.get("desc"), 400), "kind": kind}
+        keys = []
+        if kind == "choice":
+            out["choices"] = [{"label": _text(c["label"], 60), "env": {str(k): str(v) for k, v in c["env"].items()}}
+                              for c in d["choices"][:24] if isinstance(c, dict) and c.get("label") and env_ok(c.get("env"))]
+            if not out["choices"]:
+                return None
+            keys = [k for c in out["choices"] for k in c["env"]]
+        elif kind in ("num", "text"):
+            if not SAFE_ENV.match(str(d["key"])):
+                return None
+            out["key"] = str(d["key"])
+            keys = [out["key"]]
+            if kind == "num":
+                out["min"], out["max"] = int(d.get("min", 0)), int(d.get("max", 1000000))
+        else:
+            if not env_ok(d.get("on")):
+                return None
+            out["on"] = {str(k): str(v) for k, v in d["on"].items()}
+            keys = list(out["on"])
+            if env_ok(d.get("off")):
+                out["off"] = {str(k): str(v) for k, v in d["off"].items()}
+        out["needs"] = [str(n) for n in d["needs"] if SAFE_ENV.match(str(n))] if isinstance(d.get("needs"), list) else sorted(set(keys))
+        return out
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def readme_vars(vdir):
+    """KYTY_* variables a build documents in a README table (a row like: | `KYTY_X=1` | what it does |)."""
+    found = {}
+    for p in list(Path(vdir).glob("*.md"))[:8]:
+        try:
+            lines = p.read_text("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            m = re.match(r"^\|\s*`(KYTY_[A-Z0-9_]{1,60})(?:=([^`]*))?`\s*\|\s*(.+?)\s*\|?\s*$", ln)
+            if m:
+                e = found.setdefault(m[1], {"desc": re.sub(r"[`*]", "", m[3])[:300], "examples": []})
+                if m[2] and m[2] not in e["examples"]:
+                    e["examples"].append(m[2])
+    return found
+
+
+def fork_features(fork, meta=None):
+    """Settings for this build: the catalog's shared ones whose variables it documents, the catalog's entries for this
+    very fork, then every other variable its README documents (shown as plain text fields)."""
+    meta = meta or current_meta(fork)
+    if not meta:
+        return []
+    vdir = version_dir(fork, meta["tag"])
+    names = documented_env(vdir)
+    cat = catalog()
+    shared = [clean_feature(d) for d in cat.get("settings") or []] or [clean_feature(d) for d in FALLBACK_FEATURES]
+    out = {f["id"]: f for f in shared if f and all(n in names for n in f["needs"])}
+    entry = next((e for e in cat["forks"] if fork_of_entry(e) is fork), None)
+    for d in (entry or {}).get("settings") or []:
+        f = clean_feature({**d, "needs": []})
+        if f:
+            out[f["id"]] = f
+    used = set()
+    for f in out.values():
+        for c in f.get("choices", []):
+            used.update(c["env"])
+        used.update(f.get("on", {}))
+        if f.get("key"):
+            used.add(f["key"])
+    for key, e in sorted(readme_vars(vdir).items()):
+        if key not in used:
+            hint = f" Values seen in its README: {', '.join(e['examples'][:6])}." if e["examples"] else ""
+            out["var:" + key] = {"id": "var:" + key, "label": key, "kind": "text", "key": key, "desc": e["desc"] + hint, "needs": [], "auto": True}
+    return list(out.values())
+
+
+def feature_env(feats, sel):
+    env = {}
+    for f in feats:
+        v = (sel or {}).get(f["id"])
+        if v in (None, ""):
+            continue
+        if f["kind"] == "choice":
+            c = next((c for c in f["choices"] if c["label"] == v), None)
+            env.update(c["env"] if c else {})
+        elif f["kind"] == "num":
+            env[f["key"]] = str(int(v))
+        elif f["kind"] == "text":
+            env[f["key"]] = str(v).strip().replace("\n", " ")[:100]
+        elif v is True:
+            env.update(f["on"])
+        elif v is False:
+            env.update(f.get("off") or {})
+    return env
+
+
+def fork_settings(fork_id, game_id=None, feats=()):
+    """Fork-level values with the game's own values on top: {"args": {flag: value}, "env": {KEY: value}}."""
+    own = config.get("forkOpts", {}).get(fork_id) or {}
+    args, sel, env = dict(own.get("args") or {}), dict(own.get("sel") or {}), parse_env(own.get("env") or "")
+    if game_id:
+        g = config["games"].get(game_id, {}).get("forkOpts", {}).get(fork_id) or {}
+        args.update(g.get("args") or {})
+        sel.update(g.get("sel") or {})
+        env.update(parse_env(g.get("env") or ""))
+    return {"args": args, "env": {**feature_env(feats, sel), **env}}
+
+
 def running_with(fid, tag):
     with lock:
         return any(r["fork"] == fid and r["tag"] == tag and r["proc"].poll() is None for r in running.values())
 
 
-def build_args(meta, settings, ov, user=None, patch_file=None):
+def build_args(meta, settings, ov, user=None, patch_file=None, fork_args=None):
+    known = {o["flag"]: o for o in meta.get("options") or []}
     s = {**settings, **{k: v for k, v in ov.items() if v not in (None, "")}}
     flags = set(meta.get("flags") or [])
     ok = (lambda f: not flags or f in flags)
@@ -448,12 +689,21 @@ def build_args(meta, settings, ov, user=None, patch_file=None):
         add("--trophy-notifications", "true" if s["trophyNotifications"] else "false")
     if s.get("trophyDuration"):
         add("--trophy-duration", max(5, min(10, int(s["trophyDuration"]))))
+    for flag, val in (fork_args or {}).items():
+        o = known.get(flag)
+        if not o or val in (None, ""):
+            continue
+        if o["kind"] == "switch":
+            if val is True:
+                a.append(flag)
+        else:
+            a.extend([flag, str(val)])
     if s.get("extraArgs"):
         a.extend(shlex.split(s["extraArgs"], posix=False))
     return a
 
 
-def fork_env(vdir):
+def fork_env(vdir, extra_env=None):
     """What the fork's own launcher would set: the *-preset.json next to the exe (KYTY_* variables)
     and launch.json's "environment". Without it the emulator misses its shader precompile/prefetch."""
     env = dict(os.environ)
@@ -471,6 +721,7 @@ def fork_env(vdir):
         for k in [k for k in env if k.upper().startswith(("KYTY", "TRACY"))]:
             del env[k]
         env.update(extra)
+    env.update(extra_env or {})  # the user's own fork settings win over the fork's preset
     return env
 
 
@@ -490,13 +741,15 @@ def launch(game_id, fork_id):
     except Exception as e:
         raise ValueError(f"Could not link the saves folder: {e}")
     st = config["games"].setdefault(game_id, {})
-    args = [str(vdir / EXE_NAME), "--game", g["path"]] + build_args(meta, config["settings"], st.get("overrides", {}), active_user(), patch_file_for_game(game_id))
+    fs = fork_settings(fork["id"], game_id, fork_features(fork, meta))
+    args = [str(vdir / EXE_NAME), "--game", g["path"]] + build_args({**meta, "options": fork_options(fork, meta)}, config["settings"],
+                                                                      st.get("overrides", {}), active_user(), patch_file_for_game(game_id), fs["args"])
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log = LOGS_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{fork['id']}-{game_id}.log"
     with open(log, "wb") as lf:
         lf.write((" ".join(args) + "\n\n").encode("utf-8", "replace"))
         lf.flush()
-        proc = subprocess.Popen(args, cwd=str(vdir), env=fork_env(vdir), stdout=lf, stderr=subprocess.STDOUT,
+        proc = subprocess.Popen(args, cwd=str(vdir), env=fork_env(vdir, fs["env"]), stdout=lf, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL)
     run = {"id": secrets.token_hex(4), "proc": proc, "game": game_id, "fork": fork["id"], "tag": meta["tag"],
            "started": time.time(), "log": str(log), "uid": active_user()["uid"]}
@@ -851,7 +1104,8 @@ def _text(v, n=600):
 def catalog():
     """The bundled catalog, overlaid by the optional remote one (entries are matched by id)."""
     base, remote = read_json(CATALOG_FILE) or {}, read_json(DATA / "catalog-remote.json") or {}
-    out = {"updated": remote.get("updated") or base.get("updated"), "forks": [], "patches": []}
+    out = {"updated": remote.get("updated") or base.get("updated"), "forks": [], "patches": [],
+           "settings": remote.get("settings") or base.get("settings") or []}
     for key in ("forks", "patches"):
         items = {}
         for src in (base, remote):
@@ -1624,6 +1878,68 @@ class Handler(BaseHTTPRequestHandler):
                 if "overrides" in body:
                     st["overrides"] = {k: v for k, v in body["overrides"].items()
                                        if k in DEFAULT_SETTINGS and k != "githubToken"}
+                save_config()
+                return self.send_json({"ok": True})
+            if path == "/api/forkopts":  # a fork's own documented options + what is set (fork level and, if given, for a game)
+                fork = get_fork(body["fork"])
+                if not fork:
+                    raise ValueError("Unknown fork")
+                meta = current_meta(fork)
+                gid = body.get("game")
+                own = config.get("forkOpts", {}).get(fork["id"], {})
+                gown = config["games"].get(gid, {}).get("forkOpts", {}).get(fork["id"], {}) if gid else {}
+                preset = sorted(k for k in fork_env(version_dir(fork, meta["tag"])) if k.startswith("KYTY")) if meta else []
+                return self.send_json({"installed": bool(meta), "tag": meta["tag"] if meta else None,
+                                       "options": fork_options(fork, meta), "fork": own.get("args", {}), "forkEnv": own.get("env", ""),
+                                       "game": gown.get("args", {}), "gameEnv": gown.get("env", ""), "preset": preset,
+                                       "features": fork_features(fork, meta), "forkSel": own.get("sel", {}), "gameSel": gown.get("sel", {})})
+            if path == "/api/forkopts/set":
+                fork = get_fork(body["fork"])
+                if not fork:
+                    raise ValueError("Unknown fork")
+                known = {o["flag"]: o for o in fork_options(fork)}
+                args = {}
+                for flag, val in (body.get("args") or {}).items():
+                    o = known.get(flag)
+                    if not o or val in (None, ""):
+                        continue
+                    if o["kind"] == "switch":
+                        args[flag] = bool(val)
+                    elif o["kind"] == "num":
+                        n = int(str(val).strip())
+                        if "min" in o and not o["min"] <= n <= o["max"]:
+                            raise ValueError(f"{flag} takes {o['min']}-{o['max']}")
+                        args[flag] = n
+                    elif o["kind"] in ("bool", "choice"):
+                        if val not in o["choices"]:
+                            raise ValueError(f"{flag}: choose one of {', '.join(o['choices'])}")
+                        args[flag] = val
+                    else:
+                        args[flag] = str(val)[:260]
+                sel = {}
+                for f in fork_features(fork):
+                    v = (body.get("sel") or {}).get(f["id"])
+                    if v in (None, ""):
+                        continue
+                    if f["kind"] == "choice":
+                        if v not in [c["label"] for c in f["choices"]]:
+                            raise ValueError(f"{f['label']}: unknown choice")
+                    elif f["kind"] == "num":
+                        v = int(str(v).strip())
+                        if not f["min"] <= v <= f["max"]:
+                            raise ValueError(f"{f['label']} takes {f['min']}-{f['max']}")
+                    elif f["kind"] == "text":
+                        v = str(v).strip()[:100]
+                    else:
+                        v = bool(v)
+                    sel[f["id"]] = v
+                entry = {"args": args, "sel": sel, "env": ";".join(f"{k}={v}" for k, v in parse_env(body.get("env", "")).items())}
+                if body.get("game"):
+                    if body["game"] not in game_index:
+                        raise ValueError("Game not found")
+                    config["games"].setdefault(body["game"], {}).setdefault("forkOpts", {})[fork["id"]] = entry
+                else:
+                    config.setdefault("forkOpts", {})[fork["id"]] = entry
                 save_config()
                 return self.send_json({"ok": True})
             if path == "/api/settings":

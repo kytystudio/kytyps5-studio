@@ -802,6 +802,7 @@ function gameOptions(g) {
         try { await api("/api/game/set", { game: g.id, fork: f.id }); g.fork = f.id; closePanel(); refreshGames(); toast("Fork selected", `${g.title} will start on ${f.name}`); } catch (e) { fail(e); }
       }, { sel: eff && eff.id === f.id, disabled: !f.current }));
     });
+    const ef = effectiveFork(g);
     body.append(plabel("Launch settings for this game"));
     const cycle = (label, key, values) => {
       const cur = () => ov()[key];
@@ -818,6 +819,7 @@ function gameOptions(g) {
       cycle("Present mode", "presentMode", [undefined, "Mailbox", "Fifo", "Immediate"]),
       cycle("Shader cache", "shaderCache", [undefined, true, false]),
       cycle("HDR", "hdr", [undefined, true, false]));
+    if (ef && ef.current) body.append(opt(`${ef.name} settings\u2026`, "DLSS, audio, controller\u2026", () => { closePanel(); forkSettingsPanel(ef, g); }));
     const patchBox = h("div");
     body.append(patchBox);
     api("/api/patches?game=" + g.id).then(pl => {
@@ -864,9 +866,85 @@ function forkPanel(f) {
     if (f.current) body.append(h("p.pdesc", { text: "Installed: " + shortTag(f.current.tag) }));
     if (f.latest) body.append(h("p.pdesc", { text: `Latest: ${shortTag(f.latest.tag)} \u00b7 ${fmtDate(f.latest.published)}` }));
     body.append(opt(!f.current ? "Install" : f.updateAvailable ? "Update" : "Reinstall", f.latest ? shortTag(f.latest.tag).slice(0, 22) : "", () => { closePanel(); install(f, null); }, { def: true, disabled: !f.latest }),
+      opt("Fork settings\u2026", "Options of this build", () => { closePanel(); forkSettingsPanel(f); }, { disabled: !f.current }),
       opt("Use as default fork", S.defaultFork === f.id ? "Default \u2713" : "", async () => { closePanel(); try { await api("/api/fork/default", { fork: f.id }); await refreshAll(); } catch (e) { fail(e); } }));
   });
 }
+/* ---- settings of the fork itself (read from its own --help, so any fork works) ---- */
+async function forkSettingsPanel(f, g) {
+  let d;
+  try { d = await api("/api/forkopts", { fork: f.id, game: g ? g.id : undefined }); } catch (e) { return fail(e); }
+  const vals = { ...(g ? d.game : d.fork) };
+  const sel = { ...(g ? d.gameSel : d.forkSel) };
+  let env = g ? d.gameEnv : d.forkEnv;
+  const base = g ? d.fork : {};
+  const baseSel = g ? d.forkSel : {};
+  const fmt = v => v === true ? "On" : v === false ? "Off" : String(v);
+  const shown = o => vals[o.flag] !== undefined ? fmt(vals[o.flag])
+    : base[o.flag] !== undefined ? `Default (${fmt(base[o.flag])})` : o.default ? `Default (${o.default})` : "Default";
+  const save = async () => {
+    try { await api("/api/forkopts/set", { fork: f.id, game: g ? g.id : undefined, args: vals, sel, env }); return true; } catch (e) { fail(e); return false; }
+  };
+  openPanel(`${f.name} settings`,g ? `Only for ${g.title}. Default = the fork-wide value.` : (d.tag ? shortTag(d.tag) : ""), body => {
+    if (!d.installed) { body.append(h("p.pdesc", { text: "Install this fork first. Its settings are read from the build itself." })); return; }
+    if (!d.options.length) body.append(h("p.pdesc", { text: "This build lists no extra options in --help. You can still set environment variables below." }));
+    const fts = [...d.features.filter(x => !x.auto), ...d.features.filter(x => x.auto)];
+    fts.forEach((ft, i) => {
+      if (i === 0 && !ft.auto) body.append(plabel("Fork features"));
+      if (ft.auto && (i === 0 || !fts[i - 1].auto)) body.append(plabel("Documented by this build"));
+      const fshown = () => sel[ft.id] !== undefined ? fmt(sel[ft.id]) : baseSel[ft.id] !== undefined ? `Default (${fmt(baseSel[ft.id])})` : "Default";
+      const el = opt(ft.label, fshown(), async () => {
+        const old = sel[ft.id];
+        if (ft.kind === "num" || ft.kind === "text") {
+          const v = await openKeyboard({ title: ft.label, hint: ft.kind === "num" ? `${ft.min}-${ft.max}. Empty = default.` : `${ft.key}. Empty = default.`, okLabel: "Set", value: old !== undefined ? String(old) : "", max: ft.kind === "num" ? 8 : 100, numeric: ft.kind === "num" });
+          if (v === null) return;
+          if (v.trim() === "") delete sel[ft.id]; else sel[ft.id] = v.trim();
+        } else {
+          const cycle = ft.kind === "choice" ? [undefined, ...ft.choices.map(c => c.label)] : ft.off ? [undefined, true, false] : [undefined, true];
+          const nv = cycle[(cycle.indexOf(sel[ft.id]) + 1) % cycle.length];
+          if (nv === undefined) delete sel[ft.id]; else sel[ft.id] = nv;
+        }
+        if (!(await save())) { if (old === undefined) delete sel[ft.id]; else sel[ft.id] = old; }
+        $(".r", el).textContent = fshown();
+      });
+      body.append(el, h("div.odesc", { text: ft.desc }));
+    });
+    let lastGroup = null;
+    d.options.forEach(o => {
+      if (o.group !== lastGroup) { body.append(plabel(o.group)); lastGroup = o.group; }
+      const el = opt(o.label, shown(o), async () => {
+        if (o.kind === "num" || o.kind === "text") {
+          const v = await openKeyboard({ title: o.label, hint: `${o.flag}${o.min !== undefined ? ` (${o.min}-${o.max})` : ""}. Empty = default.`, placeholder: o.default || "", okLabel: "Set", value: vals[o.flag] !== undefined ? String(vals[o.flag]) : "", max: 200, numeric: o.kind === "num" });
+          if (v === null) return;
+          const old = vals[o.flag]; if (v.trim() === "") delete vals[o.flag]; else vals[o.flag] = v.trim();
+          if (!(await save())) { if (old === undefined) delete vals[o.flag]; else vals[o.flag] = old; }
+        } else {
+          const cycle = o.kind === "switch" ? [undefined, true, false] : [undefined, ...o.choices];
+          const nv = cycle[(cycle.indexOf(vals[o.flag]) + 1) % cycle.length];
+          const old = vals[o.flag]; if (nv === undefined) delete vals[o.flag]; else vals[o.flag] = nv;
+          if (!(await save())) { if (old === undefined) delete vals[o.flag]; else vals[o.flag] = old; }
+        }
+        $(".r", el).textContent = shown(o);
+      });
+      body.append(el, h("div.odesc", { text: o.desc }));
+    });
+    body.append(plabel("Environment variables"));
+    const envText = () => env ? env.split(";").join("  ") : "None";
+    const envEl = opt("Variables", envText(), async () => {
+      const v = await openKeyboard({ title: "Environment variables", hint: "NAME=value, separated by ;  e.g. KYTY_DLSS=1;KYTY_FOO=2. Empty = none.", placeholder: "NAME=value;NAME2=value", okLabel: "Set", value: env, max: 400 });
+      if (v === null) return;
+      const old = env; env = v.trim(); if (!(await save())) env = old;
+      $(".r", envEl).textContent = envText();
+    });
+    body.append(envEl, h("div.odesc", { text: "For options a fork only offers as an environment variable. Applied on top of the fork's own preset." }));
+    if (d.preset.length) body.append(h("div.odesc", { text: `This build's preset sets: ${d.preset.slice(0, 40).join(", ")}${d.preset.length > 40 ? "\u2026" : ""}` }));
+    if (Object.keys(vals).length || Object.keys(sel).length || env) body.append(plabel("Reset"), opt("Reset to default", "", async () => {
+      for (const k of Object.keys(vals)) delete vals[k]; for (const k of Object.keys(sel)) delete sel[k]; env = "";
+      if (await save()) { closePanel(); toast("Settings reset", g ? g.title : f.name); }
+    }));
+  });
+}
+
 async function addFork() {
   const repo = await ask("Add a fork", "Enter the GitHub repository (owner/repo or full URL). It must publish Windows zip builds in its releases.", "owner/KytyPS5", "Add");
   if (repo) try { await api("/api/fork/add", { repo }); await refreshAll(); toast("Fork added", repo); } catch (e) { fail(e); }
