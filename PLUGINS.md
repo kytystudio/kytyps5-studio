@@ -33,7 +33,7 @@ See `examples/hello-plugin`.
 | `row({label, desc, value, onClick})` | a Settings row; without `onClick` it is a plain info row |
 | `plugin(id).call(route, body)` | calls a route of that add-on's backend |
 | `api(path, body?)` | Studio's own HTTP API (same session token) |
-| `h`, `$`, `$$`, `toast`, `fail`, `openKeyboard`, `confirm`, `renderView`, `switchTab`, `refreshState`, `state` | UI helpers |
+| `h`, `$`, `$$`, `toast`, `fail`, `openKeyboard`, `confirm`, `renderView`, `switchTab`, `refreshState`, `refreshGames`, `state` | UI helpers |
 
 Mark focusable elements with `data-f` so the controller can reach them.
 
@@ -44,6 +44,10 @@ A backend is a Python file executed once at start-up with one extra name, `studi
 - `studio.route(name, fn)` or `@studio.route(name)`: exposes `fn(body: dict) -> JSON-able` at `/api/plugins/<id>/<name>`
 - `studio.load(default)` / `studio.save(obj)`: a small JSON state file in the add-on's own data folder
 - `studio.data_dir`, `studio.log(...)`
+- `studio.tool(name)`: path of a command-line tool shipped with Studio (`"zarchive"`, `"packwright"`), or `None`
+- `studio.rescan_games()`, `studio.save_zar_metadata(dump_dir, archive)`: refresh the game list; keep a ZAR's title and art
+- `studio.resolve_link(url, selector, ...)`: open a page in a Studio window and return a link it reveals after an
+  in-browser check (see `PLUGIN_VERIFICATION_API.md`)
 
 Backends do not receive Studio's internals; they are still ordinary Python with full access to your PC.
 

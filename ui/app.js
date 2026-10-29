@@ -1286,7 +1286,7 @@ async function loadPlugins() {
   } catch (e) { console.error("Could not load plugins", e); }
 }
 window.KytyStudio = {
-  version: 1, api, h, $, $$, toast, fail, openKeyboard, switchTab, renderView, refreshState,
+  version: 1, api, h, $, $$, toast, fail, openKeyboard, switchTab, renderView, refreshState, refreshGames,
   registerTab: registerPluginTab, registerSection: registerPluginSection, row: pluginRow,
   plugin: id => ({ call: (route, body) => api(`/api/plugins/${id}/${route}`, body || {}) }),
   confirm: (title, text, ok) => confirmBox(title, text, ok || "OK"),

@@ -67,6 +67,7 @@ CATALOG_HOSTS = ("raw.githubusercontent.com", "gist.githubusercontent.com", "git
 
 menu_req = 0         # bumped when the in-game menu hotkey is pressed
 WINDOW = None        # native pywebview window, when running as a desktop app
+WEBVIEW = None       # pywebview module, for extra windows opened on behalf of plugins
 lock = threading.RLock()
 config = {}
 jobs = {}            # job id -> state dict
@@ -346,6 +347,23 @@ def zarchive_tool():
             if candidate.is_file():
                 return candidate
     return shutil.which("zarchive.exe") or shutil.which("zarchive")
+
+
+def find_tool(name):
+    """Find a bundled command-line tool as tools/<name>.exe or tools/<name>/<name>.exe, else on PATH."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name):
+        raise ValueError("tool names are 1-40 letters, digits, - or _")
+    roots = [ROOT / "tools", Path(getattr(sys, "_MEIPASS", ROOT)) / "tools",
+             Path(sys.executable).resolve().parent / "tools"]
+    for root in roots:
+        for folder in (root, root / name):
+            if not folder.is_dir():
+                continue
+            for entry in folder.iterdir():
+                if entry.is_file() and entry.name.lower() == f"{name.lower()}.exe":
+                    return entry
+    found = shutil.which(name)
+    return Path(found) if found else None
 
 
 def zar_worker(job, source, output, tool):
@@ -2190,6 +2208,65 @@ class PluginHost:
     def log(self, *a):
         plugin_log(self.id, *a)
 
+    def tool(self, name):
+        """Path of a command-line tool shipped with Studio (e.g. "zarchive", "packwright"), or None."""
+        return find_tool(name)
+
+    def rescan_games(self):
+        """Rescan the game libraries so newly added games show up; returns the game count."""
+        return len(scan_games())
+
+    def save_zar_metadata(self, dump_dir, archive):
+        """Keep a dump's title, art and trophies beside a ZAR built from it."""
+        save_zar_metadata(dump_dir, archive)
+
+    def resolve_link(self, url, selector, title="Verification", timeout=300, reveal_after=4):
+        """Open url in a Studio window and return the href of `selector` once the page fills it in.
+
+        For hosts that only reveal a download link after an in-browser check. The window starts
+        hidden and is shown after `reveal_after` seconds so the user can finish any check
+        themselves. Blocks the calling (worker) thread; raises RuntimeError on close or timeout.
+        """
+        if WEBVIEW is None:
+            raise RuntimeError("Link verification needs the Studio desktop window")
+        if urlparse(str(url)).scheme != "https":
+            raise ValueError("Only https pages can be opened for verification")
+        closed = threading.Event()
+        probe = ("(() => { const a = document.querySelector(%s);"
+                 " return a && a.href && !a.href.endsWith('#') ? a.href : ''; })()") % json.dumps(selector)
+        width, height = 1000, 760
+        # Windows can flash a "hidden" window on creation; starting off-screen hides that.
+        win = WEBVIEW.create_window(title, url, width=width, height=height, x=-32000, y=-32000,
+                                    hidden=True, focus=False, background_color="#05070b")
+        win.events.closed += lambda *_: closed.set()
+        shown = False
+        started = time.monotonic()
+        try:
+            while time.monotonic() - started < timeout:
+                if closed.is_set():
+                    raise RuntimeError("Verification window was closed")
+                try:
+                    href = win.evaluate_js(probe)
+                except Exception:
+                    href = ""
+                if isinstance(href, str) and href.startswith("https://") and href.split("#")[0] != url:
+                    self.log(f"resolved link from {urlparse(url).hostname}")
+                    return href
+                if not shown and time.monotonic() - started >= reveal_after:
+                    screen = WEBVIEW.screens[0] if WEBVIEW.screens else None
+                    sw, sh = (screen.width, screen.height) if screen else (1920, 1080)
+                    win.move(max((sw - width) // 2, 0), max((sh - height) // 2, 0))
+                    win.show()
+                    shown = True
+                closed.wait(0.5)
+            raise RuntimeError("Timed out waiting for the verified link")
+        finally:
+            if not closed.is_set():
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+
 
 def load_plugin_backends():
     for p in plugin_manifests():
@@ -2759,6 +2836,7 @@ def main():
             window = webview.create_window("KytyPS5 Studio", url, width=1600, height=900, min_size=(1100, 650),
                                            background_color="#02060f", fullscreen=True, js_api=Api())
             globals()["WINDOW"] = window
+            globals()["WEBVIEW"] = webview
             webview.start(private_mode=False, storage_path=str(DATA / "webview"),
                           icon=str(ROOT / "icon.ico") if (ROOT / "icon.ico").exists() else None)
             os._exit(0)  # window closed: stop the server
