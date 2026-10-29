@@ -364,3 +364,16 @@ body.insettings #bg{background:radial-gradient(55% 75% at 6% -5%,rgba(205,210,22
 #ring .disc img{width:7.4rem;height:7.4rem;filter:drop-shadow(0 0 1.2rem rgba(255,255,255,.35));margin-top:.4rem}
 
 #panel .odesc{font-size:1.5rem;line-height:1.4;color:var(--ink3);margin:-.2rem 1.6rem 1.2rem;font-weight:300}
+.zar-choice-options{display:flex;flex-direction:column;align-items:stretch;gap:1.2rem;max-width:52rem;margin:0 auto 2rem}
+.zar-choice-options .pill{width:100%;min-height:6rem;font-size:2.1rem}
+.library-heading{font-weight:600;color:var(--ink2)}
+.library-game{align-items:center;min-height:8rem;gap:1.5rem}
+.library-game>div:first-child{min-width:0;overflow-wrap:anywhere}
+.library-game-actions{display:flex;align-items:center;justify-content:flex-end;gap:1rem;flex-shrink:0;flex-wrap:wrap}
+.library-game .badge{padding:.7rem 1.1rem;border-radius:2rem;background:rgba(255,255,255,.1);font-size:1.5rem;color:var(--ink2)}
+.library-game .pill{height:4.5rem;padding:0 1.6rem;font-size:1.6rem}
+.library-game small{max-width:55rem;overflow-wrap:anywhere}
+.zar-progress{display:block;position:relative;width:min(34rem,60vw);height:.5rem;margin-top:.8rem;overflow:hidden;border-radius:1rem;background:rgba(255,255,255,.12)}
+.zar-progress i{position:absolute;inset:0 auto 0 0;width:38%;border-radius:inherit;background:var(--ink);animation:zar-slide 1.2s ease-in-out infinite alternate}
+.zar-task{width:100%;max-width:55rem;margin-top:.7rem}
+@keyframes zar-slide{from{transform:translateX(0)}to{transform:translateX(160%)}}

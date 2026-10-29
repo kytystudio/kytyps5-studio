@@ -359,6 +359,7 @@ const hue = s => { let x = 0; for (const c of s) x = (x * 31 + c.charCodeAt(0)) 
 const fmtDate = ts => ts ? new Date(ts).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" }) : "-";
 const shortTag = t => (t || "").replace(/^KytyPS5-/, "");
 const fmtMB = b => (b / 1048576).toFixed(1) + " MB";
+const fmtBytes = b => b >= 1073741824 ? (b / 1073741824).toFixed(2) + " GB" : fmtMB(b || 0);
 function fmtPlay(sec) { if (!sec) return "Never played"; const m = Math.round(sec / 60); return m < 60 ? `${m} min played` : `${Math.floor(m / 60)} h ${m % 60} min played`; }
 function ago(ts) {
   if (!ts) return "Never played";
@@ -469,7 +470,7 @@ function options() {
 }
 function nextTab(d) {
   if ($("#overlay.on") || $("#panel.on") || $("#cc.on") || $("#users.on") || $("#osk.on")) return;
-  const tabs = ["games"], i = tabs.indexOf(tab) + d;
+  const tabs = $$("#tabs .tab").filter(x => !x.hidden).map(x => x.dataset.tab), i = tabs.indexOf(tab) + d;
   if (i < 0 || i >= tabs.length) return;
   sfx.tab(); switchTab(tabs[i]);
   if (F.cur?.closest("#top")) setFocus($(`.tab[data-tab="${tab}"]`), true);
@@ -636,6 +637,13 @@ function renderTop() {
   const av = $("#avatar"); if (av) av.replaceChildren(avatarEl(me()));
   document.body.classList.toggle("insettings", ["settings", "trophies", "trophylist"].includes(tab));
   $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === tab));
+  for (const [id, extension] of pluginTabs) {
+    const button = $(`.tab[data-tab="${id}"]`);
+    if (button) {
+      try { button.hidden = extension.visible ? !extension.visible() : false; }
+      catch (_) { button.hidden = true; }
+    }
+  }
   const f = forkById(S.defaultFork), chip = $("#fork-chip");
   if (!f) return;
   const st = !f.current ? "bad" : f.updateAvailable ? "warn" : "good";
@@ -671,10 +679,25 @@ $("#btn-power").addEventListener("click", async () => {
 
 /* ------------------------------------------------------------ views --- */
 const view = () => $("#screen");
+function chooseZarConversion(gameTitle) {
+  return new Promise(resolve => {
+    const done = value => { hideOverlay(); resolve(value); };
+    showOverlay(h("div.ov.zar-choice", {},
+      h("h2", { text: "Convert game to ZAR" }),
+      h("p", { text: `Choose what to do with ${gameTitle} after conversion.` }),
+      h("div.zar-choice-options", {},
+        h("button.pill", { "data-f": true, "data-default": true, on: { click: () => done(false) } }, "Convert only"),
+        h("button.pill.ghost", { "data-f": true, on: { click: () => done(true) } }, "Convert and remove folder"),
+        h("button.pill.ghost", { "data-f": true, on: { click: () => done(null) } }, "Cancel"))),
+      () => done(null));
+  });
+}
 function renderView() {
   const keep = F.cur?.dataset?.key;
   window._lastKey = keep;
-  const v = { games: viewGames, settings: viewSettings, trophies: viewTrophies, trophylist: viewTrophyGame }[tab]();
+  const render = { games: viewGames, settings: viewSettings, trophies: viewTrophies, trophylist: viewTrophyGame }[tab] || pluginTabs.get(tab)?.render;
+  if (!render) { tab = "games"; renderTop(); return renderView(); }
+  const v = render();
   view().replaceChildren(v);
   if (tab !== "games") setArt(null);
   if (tab === "games") updateHero();
@@ -1040,9 +1063,9 @@ function installedForkPanel(f) {
   openPanel(f.name, f.current ? shortTag(f.current.tag) : "Not installed", body => {
     body.append(opt("Choose another version\u2026", "Older builds or switch between installed ones", () => { closePanel(); versionsPanel(f); }),
       opt("Open fork folder", "", () => api("/api/open", { fork: f.id }).catch(fail), { disabled: !f.current }),
-      opt("Open saves folder", "Saves, trophies and shader cache that survive updates", () => api("/api/open", { dataFork: f.id }).catch(fail)),
+      opt("Open saves folder", "Shared saves and trophies; shader caches remain per fork", () => api("/api/open", { dataFork: f.id }).catch(fail)),
       opt("Import saves\u2026", "From another KytyPS5 folder", async () => { try { const r = await api("/api/import", { fork: f.id }); if (r.copied.length) toast("Saves imported", r.copied.join(", ")); } catch (e) { fail(e); } }));
-    if (!f.builtin) body.append(opt("Remove fork", "Saves are moved to a backup folder, never deleted", async () => { closePanel(); try { await api("/api/fork/remove", { fork: f.id }); forkSel = null; await refreshAll(); await loadCommunity(); } catch (e) { fail(e); } }));
+    if (!f.builtin) body.append(opt("Remove fork", "Shared saves and trophies remain available to other forks", async () => { closePanel(); try { await api("/api/fork/remove", { fork: f.id }); forkSel = null; await refreshAll(); await loadCommunity(); } catch (e) { fail(e); } }));
   });
 }
 async function importPatch() {
@@ -1072,6 +1095,17 @@ function viewSettings() {
     return h("button.row", { "data-f": true, "data-key": "s" + key, on: { click: e => { if (e.target !== inp) editInput(e.currentTarget); } } }, label(l, desc), inp);
   };
   const action = (l, desc, fn, right) => h("button.row", { "data-f": true, "data-key": "a" + l, on: { click: fn } }, label(l, desc), h("span.val", { text: right || "" }));
+  const pluginRows = () => [
+    pluginRow({ label: "Add-ons", desc: "Optional extras you install yourself; Studio ships none. An add-on runs with the same access to your PC as Studio, so install only what you trust. Changes apply after restarting Studio." }),
+    ...pluginList.map(p => {
+      const sw = h("i.switch" + (p.enabled ? ".on" : ""));
+      return h("button.row", { "data-f": true, "data-key": "pl" + p.id, on: { click: async () => {
+        try { await api("/api/plugins/enable", { id: p.id, enabled: !p.enabled }); p.enabled = !p.enabled; sw.classList.toggle("on", p.enabled); toast(p.name, "Restart Studio to apply"); } catch (e) { fail(e); }
+      } } }, label(p.name + (p.version ? "  " + p.version : ""), [p.description, p.author && "by " + p.author, p.error && "Error: " + p.error].filter(Boolean).join(" · ") || p.id), sw);
+    }),
+    ...(pluginList.length ? [] : [pluginRow({ label: "No add-ons installed", desc: "Put an add-on folder (with a plugin.json) into the folder below and restart Studio." })]),
+    action("Open add-ons folder", pluginDir, () => api("/api/open", { what: "plugins" }).catch(fail)),
+    action("Open logs folder", "Each add-on writes plugin-<id>.log here", () => api("/api/open", { what: "logs" }).catch(fail))];
   const commRows = () => {
     const rows = [h("div.row.info", {}, h("div", {}, "Third-party builds and patches", h("small", { text: "Made by community members, not by Studio. Install only what you trust." })))];
     if (!CM) {
@@ -1122,6 +1156,32 @@ function viewSettings() {
   const cats = [
     ["Forks", forkRows],
     ["Library", [
+      h("div.row.info.library-heading", {}, h("div", {}, "Games in library", h("small", { text: "Format and conversion status" }))),
+      ...games.map(g => {
+        const task = (S.zarJobs || []).find(j => j.game === g.id && ["queued", "scanning", "compressing"].includes(j.state));
+        const finished = [...(S.zarJobs || [])].reverse().find(j => j.game === g.id && ["done", "error"].includes(j.state));
+        const convertGame = async () => {
+          const deleteSource = await chooseZarConversion(g.title);
+          if (deleteSource === null) return;
+          if (deleteSource && !(await confirmBox("Remove the original game folder?",
+            "After ZArchive finishes successfully, Studio will remove this folder and keep the ZAR archive as the game copy. This cannot be undone from Studio.", "Convert and remove"))) return;
+          try { await api("/api/game/convert-zar", { game: g.id, deleteSource }); await refreshState(); }
+          catch (e) { fail(e); }
+        };
+        const convert = g.format === "Folder" && !task && S.zarAvailable
+          ? h("button.pill", { "data-f": true, "data-key": `zar-${g.id}`, on: { click: convertGame } }, "Convert")
+          : null;
+        return h("div.row.info.library-game", {}, h("div", {}, g.title,
+          h("small", { text: `${g.titleId || g.path} · ${g.format || "Folder"}` }),
+          finished?.state === "error" ? h("small", { text: `Conversion failed: ${finished.message}` }) : null,
+          finished?.state === "done" ? h("small", { text: finished.message }) : null,
+          task ? h("div.zar-task", {}, h("small", { "data-zar-pm": task.id, text: task.state === "scanning" ? "Scanning game files…" :
+            `${task.state === "queued" ? "Starting compression" : "Compressing to ZAR"} · ${fmtBytes(task.writtenBytes || 0)} written${task.sourceBytes ? ` · ${fmtBytes(task.sourceBytes)} source` : ""}` }),
+            h("span.zar-progress", {}, h("i"))) : null),
+          h("div.library-game-actions", {}, h("span.badge", { text: g.format || "Folder" }),
+            convert,
+            g.format === "ZAR" ? h("span.val", { text: "Ready" }) : !S.zarAvailable && g.format === "Folder" ? h("span.val", { text: "ZArchive unavailable" }) : null));
+      }),
       ...S.libraries.map(p => action(p, "Select to remove this folder from the library", async () => { try { await api("/api/library/remove", { path: p }); await refreshAll(); } catch (e) { fail(e); } }, "Remove")),
       action("Add game folder\u2026", "Games are detected by their sce_sys folder", addLibrary),
       action("Rescan library", "", async () => { await refreshGames(); toast("Library scanned", `${games.length} game(s) found`); }, `${games.length} games`)]],
@@ -1146,13 +1206,15 @@ function viewSettings() {
       text("GitHub token", "githubToken", "Optional. Raises the API rate limit from 60 to 5000 requests/hour", "password"),
       action("Open logs folder", "Game logs are kept here", () => api("/api/open", { what: "logs" }).catch(fail))]],
     ["Community (advanced)", commRows],
+    ...pluginSections.map(x => [x.label, () => x.rows()]),
+    ["Plugins", pluginRows],
     ["About & legal", () => [
       h("div.row.info", {}, h("div", {}, "KytyPS5 Studio", h("small", { text: "A launcher and manager for KytyPS5 builds. Free of charge. No telemetry." }))),
       h("div.row.info", {}, h("div", {}, "Not affiliated", h("small", { text: "Not affiliated with, endorsed by or connected to Sony Interactive Entertainment, PlayStation or the KytyPS5 project. PlayStation and PS5 are trademarks of Sony Interactive Entertainment Inc.; they are used only to say what the software works with." }))),
       h("div.row.info", {}, h("div", {}, "Look and feel", h("small", { text: "The interface is an original recreation inspired by the PlayStation 5 home screen. No Sony artwork, fonts, logos or sounds are included; avatars and sounds are generated by Studio. The cat-gamepad logo is the KytyPS5 project's own artwork, used to identify the emulator; it is not made by Studio." }))),
       h("div.row.info", {}, h("div", {}, "No games, no firmware", h("small", { text: "Studio contains no games, firmware, keys or copyrighted game data and does not download any. Use only games you own and dumped yourself." }))),
       h("div.row.info", {}, h("div", {}, "Emulators and patches", h("small", { text: "Emulator builds are downloaded by you from their authors' GitHub releases and keep their own licenses (GPL-2.0 for the forks listed in the sample catalog). Studio ships none of them, nor any patch. The only default is the address of a metadata-only catalog, read when you open Settings, Community; nothing is installed until you press Install. Patches belong to their authors." }))),
-      h("div.row.info", {}, h("div", {}, "Third-party software", h("small", { text: "Python, pywebview, pythonnet and other libraries are bundled under their own licenses. See THIRD_PARTY_LICENSES.txt in the installation folder." })))]],
+      h("div.row.info", {}, h("div", {}, "Third-party software", h("small", { text: "ZArchive-Next, zstandard, Python, pywebview, pythonnet and other libraries are bundled under their own licenses. See THIRD_PARTY_LICENSES.txt in the installation folder." })))]],
     ["Exit", [action("Exit KytyPS5 Studio", "Running games are not closed", () => api("/api/quit", {}).then(() => window.close()).catch(() => { }))]],
   ];
   const v = h("div.view.settings"), left = h("div.cats"), right = h("div.items#items");
@@ -1178,16 +1240,73 @@ function viewSettings() {
   return v;
 }
 
+/* ------------------------------------------------------------ plugins --- */
+// Optional add-ons the user installed. Studio does not know what they do: it loads the enabled ones and
+// gives them window.KytyStudio (see PLUGINS.md).
+const pluginTabs = new Map(), pluginSections = [];
+let pluginList = [], pluginDir = "";
+function pluginRow({ label, desc, value, onClick }) {
+  const body = h("div", {}, label, desc ? h("small", { text: desc }) : null);
+  return onClick ? h("button.row", { "data-f": true, "data-key": "p" + label, on: { click: onClick } }, body, h("span.val", { text: value || "" }))
+    : h("div.row.info", {}, body);
+}
+function registerPluginTab(x) {
+  if (!x || !/^[a-z][a-z0-9-]{0,47}$/.test(x.id || "") || typeof x.render !== "function") return;
+  pluginTabs.set(x.id, x);
+  let b = $(`.tab[data-tab="${x.id}"]`);
+  if (!b) {
+    b = h("button.tab", { "data-tab": x.id, "data-f": true, text: x.label || x.id });
+    b.addEventListener("click", () => { sfx.tab(); switchTab(x.id); });
+    $("#tabs").append(b);
+  } else b.textContent = x.label || x.id;
+  renderTop();
+}
+function registerPluginSection(x) {
+  if (x && x.label && typeof x.rows === "function") pluginSections.push(x);
+}
+function reportPluginError(text) {  // script errors from a plugin's files go to its log file
+  const m = /\/api\/plugins\/ui\/([a-z][a-z0-9-]+)\//.exec(text || "");
+  if (m) api("/api/plugins/log", { id: m[1], text }).catch(() => { });
+}
+window.addEventListener("error", e => reportPluginError((e.filename || "") + " " + (e.message || "") + " " + (e.error?.stack || "")));
+window.addEventListener("unhandledrejection", e => reportPluginError(String(e.reason?.stack || e.reason || "")));
+async function loadPlugins() {
+  try {
+    const r = await api("/api/plugins");
+    pluginList = r.plugins; pluginDir = r.dir;
+    for (const p of pluginList.filter(p => p.enabled)) {
+      try {
+        if (p.styles) document.head.append(h("link", { rel: "stylesheet", href: `/api/plugins/ui/${p.id}/${p.styles}?t=${encodeURIComponent(TOKEN)}` }));
+        if (p.script) await new Promise((ok, no) => {
+          const s = h("script", { src: `/api/plugins/ui/${p.id}/${p.script}?t=${encodeURIComponent(TOKEN)}` });
+          s.onload = ok; s.onerror = () => no(new Error("could not load " + p.script)); document.head.append(s);
+        });
+      } catch (e) { p.error = String(e.message || e); console.error("Plugin " + p.id, e); }
+    }
+  } catch (e) { console.error("Could not load plugins", e); }
+}
+window.KytyStudio = {
+  version: 1, api, h, $, $$, toast, fail, openKeyboard, switchTab, renderView, refreshState,
+  registerTab: registerPluginTab, registerSection: registerPluginSection, row: pluginRow,
+  plugin: id => ({ call: (route, body) => api(`/api/plugins/${id}/${route}`, body || {}) }),
+  confirm: (title, text, ok) => confirmBox(title, text, ok || "OK"),
+  get state() { return S; }, get activeTab() { return tab; },
+};
+
 /* ------------------------------------------------------ data refresh --- */
 async function refreshGames() {
   try { games = await api("/api/games"); } catch (e) { fail(e); }
-  if (tab === "games") renderView();
+  if (tab === "games" || (tab === "settings" && setCat === 1)) renderView();
 }
 let lastSig = "";
-const sig = () => JSON.stringify([S.forks, S.settings, S.libraries, S.defaultFork, S.jobs.map(j => [j.id, j.state])]);
+const sig = () => JSON.stringify([S.forks, S.settings, S.libraries, S.defaultFork, S.jobs.map(j => [j.id, j.state]), (S.zarJobs || []).map(j => [j.id, j.state]), S.zarAvailable]);
 async function refreshState() {
+  const oldZarStates = new Map((S.zarJobs || []).map(j => [j.id, j.state]));
   const st = await api("/api/state");
   Object.assign(S, st);
+  if ((S.zarJobs || []).some(j => ["done", "error"].includes(j.state) && oldZarStates.get(j.id) !== j.state)) {
+    try { games = await api("/api/games"); } catch (_) {}
+  }
   handleEvents();
   const s = sig();
   if (s !== lastSig) {
@@ -1199,6 +1318,13 @@ async function refreshState() {
     const bar = $(`[data-pf="${j.fork}"]`), msg = $(`[data-pm="${j.fork}"]`);
     if (bar) bar.style.width = (j.progress * 100).toFixed(1) + "%";
     if (msg) msg.textContent = j.message + (j.speed && j.state === "downloading" ? `  ·  ${(j.speed / 1048576).toFixed(1)} MB/s` : "");
+  }
+  for (const j of S.zarJobs || []) {
+    const msg = $$('[data-zar-pm]').find(el => el.dataset.zarPm === String(j.id));
+    if (msg && ["queued", "scanning", "compressing"].includes(j.state)) {
+      msg.textContent = j.state === "scanning" ? "Scanning game files…" :
+        `${j.state === "queued" ? "Starting compression" : "Compressing to ZAR"} · ${fmtBytes(j.writtenBytes || 0)} written${j.sourceBytes ? ` · ${fmtBytes(j.sourceBytes)} source` : ""}`;
+    }
   }
 }
 async function refreshAll() { await refreshState(); await refreshGames(); }
@@ -1233,7 +1359,7 @@ function handleEvents() {
     }
   }
 }
-(function loop() { refreshState().catch(() => { }).finally(() => setTimeout(loop, S.jobs.some(j => ["downloading", "extracting", "queued"].includes(j.state)) || S.running.some(r => r.alive) ? 800 : 3000)); })();
+(function loop() { refreshState().catch(() => { }).finally(() => setTimeout(loop, S.jobs.some(j => ["downloading", "extracting", "queued"].includes(j.state)) || (S.zarJobs || []).some(j => ["queued", "scanning", "compressing"].includes(j.state)) || S.running.some(r => r.alive) ? 800 : 3000)); })();
 
 /* ------------------------------------------------------ start screen -- */
 let bootDone = false, bootReady = false;
@@ -1284,6 +1410,7 @@ function bootAnim() {
 (async function init() {
   document.addEventListener("pointerdown", () => { actx = actx || new AudioContext(); actx.resume?.(); }, { once: true });
   try { await refreshState(); await refreshGames(); } catch (e) { fail(e); }
+  await loadPlugins();
   loadTrophies().then(() => { if (tab === "games") updateHero(); });
   lastSig = sig();
   renderTop(); renderView();

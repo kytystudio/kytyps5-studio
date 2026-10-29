@@ -11,8 +11,12 @@ those builds up to date, and keep your saves and trophies safe across updates.
 - **Games**: scans your library folders (folders with `sce_sys/param.json`) and shows the icon and background art.
 - **Forks**: installs and updates builds from their GitHub releases (Windows zip). Several can live side by side;
   each game can use its own. Only the upstream KytyPS5 is listed on a fresh install.
-- **Saves survive updates**: `_SaveData`, `_Trophies`, `_DownloadData` and the shader cache live in
-  `forks/<fork>/_data` and are linked into each version folder. Nothing is overwritten without a copy being kept.
+- **Saves survive updates and are shared by every fork**: `_SaveData`, `_Trophies` and `_DownloadData` live in
+  `shared-user-data` and are linked into each version folder; shader caches stay per fork in `forks/<fork>/_data`.
+  Nothing is overwritten without a copy being kept in `userdata-conflicts`.
+- **ZAR**: the Library settings list each game's format (Folder or ZAR) and can convert a game folder into a single
+  `.zar` archive with the bundled ZArchive-Next tool, optionally removing the folder afterwards. Studio keeps the title,
+  art and trophy data beside the archive and plays time per title, so conversion loses nothing.
 - **Users**: PS5-style user selection. Saves, trophies and play time are kept per user (emulator `--user-id`).
 - **Trophies**: reads the game's `trophy00.ucp`, shows levels, points and per-game lists, per user.
 - **Shaders**: applies each fork's preset (`*-preset.json`) like its own launcher, keeps the shader cache between updates,
@@ -31,7 +35,7 @@ Needs Windows 10/11 with the WebView2 runtime (included with Windows 11) and Pyt
 
 ## Build the installer
 ```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1     # dist\KytyPS5Studio\KytyPS5Studio.exe
+powershell -ExecutionPolicy Bypass -File build.ps1     # dist\KytyPS5Studio\KytyPS5Studio.exe (downloads ZArchive-Next 0.1 from its GitHub release, so it needs internet)
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer.iss    # installer\KytyPS5Studio-Setup.exe
 ```
 User data is stored in `%LOCALAPPDATA%\KytyPS5Studio` when installed, or in `data/` when run from source.

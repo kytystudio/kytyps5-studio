@@ -11,8 +11,8 @@ KytyPS5 Studio is an independent, free launcher and manager for emulator builds 
   the KytyPS5 authors. The licence of the artwork itself is not stated separately. It is used here only to
   identify the emulator this tool manages. **Ask the KytyPS5 authors for permission before you distribute
   Studio**, or replace `ui/logo.svg` and `icon.ico` with your own artwork. Using it does not mean the authors endorse this tool.
-- Third-party libraries (Python runtime, pywebview, pythonnet and their dependencies) under their own
-  licenses; the texts are in `THIRD_PARTY_LICENSES.txt`.
+- Third-party software (Python runtime, pywebview, pythonnet, their dependencies and the bundled
+  ZArchive-Next command-line tool) under their own licenses; the texts are in `THIRD_PARTY_LICENSES.txt`.
 
 ## What this project does NOT contain
 - No games, no console firmware or system software, no encryption keys, no dumps of any kind, and no way to download them.

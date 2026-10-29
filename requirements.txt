@@ -2,3 +2,5 @@
 pywebview>=6.0
 # only to build the .exe
 pyinstaller>=6.0
+# reads trophies and art straight from ZAR archives
+zstandard==0.25.0

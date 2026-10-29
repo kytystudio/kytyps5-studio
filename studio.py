@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """KytyPS5 Studio - fork manager and PS5-style launcher for KytyPS5 builds.
 
-Pure standard library. Serves the UI in ./ui on 127.0.0.1 and opens it in an
-Edge/Chrome "app" window (no browser chrome) so it feels like a console shell.
+Serves the UI in ./ui on 127.0.0.1 and opens it in an Edge/Chrome "app"
+window. The optional zstandard package enables random-access reads from ZARs.
 
     python studio.py                 # open the shell
     python studio.py --no-browser    # only run the server (dev)
@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import zipfile
@@ -40,6 +41,8 @@ FORKS_DIR = DATA / "forks"
 LOGS_DIR = DATA / "logs"
 TMP_DIR = DATA / "tmp"
 CONFIG_FILE = DATA / "config.json"
+PLUGINS_DIR = DATA / "plugins"  # add-ons the user installed; Studio ships none
+PLUGIN_DATA_DIR = DATA / "plugin-data"
 COMMUNITY_DIR = DATA / "community"  # editable by the user; Studio ships with nothing here
 CATALOG_FILE = COMMUNITY_DIR / "catalog.json"
 PATCH_DIR = DATA / "patches"
@@ -86,6 +89,7 @@ def load_config():
         except (OSError, ValueError):
             shutil.copy(CONFIG_FILE, CONFIG_FILE.with_suffix(".bad"))
     cfg.setdefault("forks", [])
+    cfg.setdefault("pluginsDisabled", [])
     for f in cfg["forks"]:
         f["builtin"] = f["id"] == "original"
     known = {f["id"] for f in cfg["forks"]}
@@ -99,6 +103,8 @@ def load_config():
             cfg["settings"]["catalogUrl"] = DEFAULT_CATALOG
     cfg.setdefault("libraries", [])
     cfg.setdefault("games", {})
+    if not isinstance(cfg.get("titleStats"), dict):
+        cfg["titleStats"] = {}
     cfg.setdefault("defaultFork", "original")
     cfg.setdefault("users", [])
     if not cfg["users"]:  # first run / upgrade: the existing saves belong to user id 1000
@@ -324,6 +330,120 @@ def set_job(job, **kw):
         job.update(kw)
 
 
+# ----------------------------------------------------------- ZAR conversion ---
+
+zar_jobs = {}
+
+
+def zarchive_tool():
+    """Find an optional ZArchive-Next CLI shipped beside the app or installed on PATH."""
+    names = ("zarchive.exe", "zarchive")
+    roots = [ROOT, ROOT / "tools", Path(sys.executable).resolve().parent / "tools",
+             Path(sys.executable).resolve().parent]
+    for root in roots:
+        for name in names:
+            candidate = root / name
+            if candidate.is_file():
+                return candidate
+    return shutil.which("zarchive.exe") or shutil.which("zarchive")
+
+
+def zar_worker(job, source, output, tool):
+    log_path = TMP_DIR / f"{job['id']}.zar.log"
+    try:
+        set_job(job, state="scanning", message="Calculating source size", writtenBytes=0, sourceBytes=0, fileCount=0)
+        source_bytes = file_count = 0
+        for root, _, files in os.walk(source):
+            for name in files:
+                try:
+                    source_bytes += (Path(root) / name).stat().st_size
+                    file_count += 1
+                except OSError:
+                    continue
+        set_job(job, state="compressing", message="Compressing · starting ZArchive", sourceBytes=source_bytes, fileCount=file_count)
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        command = [str(tool), str(source), str(output)]
+        with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+            process = subprocess.Popen(command, cwd=str(tool.parent if isinstance(tool, Path) else source.parent),
+                                       stdout=log, stderr=subprocess.STDOUT, shell=False,
+                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            while process.poll() is None:
+                try:
+                    written = output.stat().st_size
+                except OSError:
+                    written = 0
+                set_job(job, writtenBytes=written,
+                        message=f"Compressing · {written / 1073741824:.2f} GB written")
+                time.sleep(.6)
+            return_code = process.wait()
+        if return_code:
+            try:
+                with open(log_path, "rb") as log:
+                    log.seek(max(0, log.seek(0, os.SEEK_END) - 8192))
+                    detail = log.read().decode("utf-8", errors="replace").strip()
+            except OSError:
+                detail = ""
+            raise RuntimeError((detail or f"ZArchive exited with code {return_code}")[-1200:])
+        if not output.is_file() or output.stat().st_size == 0:
+            raise RuntimeError("ZArchive did not produce an archive")
+        message = "ZAR archive created"
+        metadata_saved = False
+        try:
+            save_zar_metadata(source, output)
+            metadata_saved = True
+        except OSError as e:
+            message += f"; metadata backup failed: {e}"
+        source_title_id = (game_index.get(job["game"]) or {}).get("titleId")
+        promote_game_stats(job["game"], source_title_id)
+        save_config()
+        if job.get("deleteSource"):
+            if not metadata_saved:
+                message += "; original kept because metadata backup failed"
+            elif source.resolve() in {Path(path).resolve() for path in config.get("libraries", [])}:
+                message += "; original kept because it is itself a library root"
+            elif is_link(source):
+                message += "; original kept because it is a link or junction"
+            elif any(run["game"] == job["game"] and run["proc"].poll() is None for run in running.values()):
+                message += "; original kept because the game is still running"
+            else:
+                try:
+                    shutil.rmtree(source)
+                    message += "; original folder removed"
+                except OSError as e:
+                    message += f"; could not remove original folder: {e}"
+        set_job(job, state="done", progress=1.0, message=message, output=str(output))
+        scan_games()
+    except Exception as e:
+        output.unlink(missing_ok=True)
+        set_job(job, state="error", message=str(e) or e.__class__.__name__)
+    finally:
+        log_path.unlink(missing_ok=True)
+
+
+def start_zar_conversion(game_id, delete_source=False):
+    game = game_index.get(str(game_id))
+    if not game:
+        scan_games()
+        game = game_index.get(str(game_id))
+    if not game or game.get("format") != "Folder":
+        raise ValueError("Only extracted game folders can be converted to ZAR")
+    tool = zarchive_tool()
+    if not tool:
+        raise ValueError("ZArchive-Next is not installed with the app or available on PATH")
+    source = Path(game["path"])
+    output = source.with_name(source.name + ".zar")
+    if output.exists():
+        raise ValueError(f"Output already exists: {output.name}")
+    with lock:
+        if any(j["game"] == game_id and j["state"] in ("queued", "scanning", "compressing") for j in zar_jobs.values()):
+            return next(j for j in zar_jobs.values() if j["game"] == game_id and j["state"] in ("queued", "scanning", "compressing"))
+        job = {"id": secrets.token_hex(6), "game": game_id, "item": source.name, "state": "queued",
+               "message": "Queued", "progress": 0, "deleteSource": bool(delete_source), "started": time.time()}
+        zar_jobs[job["id"]] = job
+    threading.Thread(target=zar_worker, args=(job, source, output, tool), daemon=True).start()
+    return job
+
+
 def install_worker(job, fork, release):
     tmp_zip = TMP_DIR / f"{job['id']}.zip"
     tmp_dir = TMP_DIR / job["id"]
@@ -433,6 +553,73 @@ def parse_param(sce):
     return name, p.get("titleId") or p.get("title_id"), p.get("contentVersion")
 
 
+ZAR_ART = ("icon0.png", "pic0.png", "pic1.png")
+
+
+def zar_sidecar(archive):
+    return Path(str(archive) + ".studio")
+
+
+def save_zar_metadata(source, archive):
+    """Keep game title metadata and display art beside a generated ZAR."""
+    sce = Path(source) / "sce_sys"
+    name, title_id, version = parse_param(sce)
+    sidecar = zar_sidecar(archive)
+    art_dir = sidecar / "art"
+    art_dir.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for art_name in ZAR_ART:
+        src = sce / art_name
+        if src.is_file():
+            shutil.copy2(src, art_dir / art_name)
+            copied.append(art_name)
+    trophy_source = sce / "trophy2" / "trophy00.ucp"
+    if trophy_source.is_file():
+        trophy_dir = sidecar / "trophy"
+        trophy_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(trophy_source, trophy_dir / "trophy00.ucp")
+    data = {"title": name or Path(source).name, "titleId": title_id, "version": version, "art": copied}
+    temp = sidecar / "metadata.tmp"
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    temp.replace(sidecar / "metadata.json")
+
+
+def load_zar_metadata(archive):
+    """Read a ZAR sidecar, or recover display metadata from its sibling dump."""
+    archive = Path(archive)
+    sidecar = zar_sidecar(archive)
+    try:
+        data = json.loads((sidecar / "metadata.json").read_text("utf-8"))
+        art_dir = sidecar / "art"
+        if data.get("title") and data.get("titleId"):
+            return data, {name: art_dir / name for name in ZAR_ART}
+    except (OSError, ValueError, TypeError):
+        pass
+    source = archive.with_suffix("")
+    if source.is_dir():
+        sce = source / "sce_sys"
+        name, title_id, version = parse_param(sce)
+        return {"title": name or source.name, "titleId": title_id, "version": version}, {
+            art_name: sce / art_name for art_name in ZAR_ART}
+    try:
+        sce_sidecar = sidecar / "sce_sys"
+        param = cached_zar_file(archive, "sce_sys/param.json", sce_sidecar / "param.json", 4 * 1024 * 1024)
+        if param:
+            name, title_id, version = parse_param(sce_sidecar)
+            art = {}
+            for art_name in ZAR_ART:
+                art[art_name] = cached_zar_file(archive, f"sce_sys/{art_name}", sidecar / "art" / art_name,
+                                                64 * 1024 * 1024)
+            data = {"title": name or archive.stem, "titleId": title_id, "version": version}
+            sidecar.mkdir(parents=True, exist_ok=True)
+            (sidecar / "metadata.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+            return data, art
+    except (OSError, ValueError, RuntimeError, struct.error):
+        pass
+    return {"title": archive.stem, "titleId": None, "version": None}, {
+        art_name: None for art_name in ZAR_ART}
+
+
 def scan_games():
     found, index = [], {}
     for lib in config["libraries"]:
@@ -455,24 +642,41 @@ def scan_games():
                 bg = pic1 if pic1.exists() else pic0 if pic0.exists() else None
                 fg = pic0 if pic1.exists() and pic0.exists() else None  # pic0 = transparent logo overlay
                 icon = sce / ART["icon"]
-                index[gid] = {"path": str(d), "icon": icon if icon.exists() else None, "bg": bg, "fg": fg, "titleId": title_id, "version": cver}
-                found.append({"id": gid, "title": name or d.name, "titleId": title_id, "path": str(d),
+                index[gid] = {"path": str(d), "format": "Folder", "icon": icon if icon.exists() else None,
+                              "bg": bg, "fg": fg, "titleId": title_id, "version": cver}
+                found.append({"id": gid, "title": name or d.name, "titleId": title_id, "path": str(d), "format": "Folder",
                               "icon": icon.exists(), "bg": bool(bg), "fg": bool(fg), "version": cver})
                 continue
             for e in entries:
                 if e.is_dir(follow_symlinks=False) and depth < 2:
+                    if e.name.lower().endswith(".zar.studio"):
+                        continue
                     stack.append((Path(e.path), depth + 1))
                 elif e.is_file() and e.name.lower().endswith(".zar"):
                     gid = hashlib.sha1(e.path.lower().encode()).hexdigest()[:12]
-                    index[gid] = {"path": e.path, "icon": None, "bg": None, "fg": None}
-                    found.append({"id": gid, "title": Path(e.name).stem, "titleId": None, "path": e.path,
-                                  "icon": False, "bg": False, "fg": False, "version": None})
+                    source_dump = Path(e.path).with_suffix("")
+                    if source_dump.is_dir() and not (zar_sidecar(e.path) / "metadata.json").is_file():
+                        try:
+                            save_zar_metadata(source_dump, e.path)
+                        except OSError:
+                            pass
+                    metadata, art = load_zar_metadata(e.path)
+                    icon = art.get("icon0.png")
+                    pic0, pic1 = art.get("pic0.png"), art.get("pic1.png")
+                    bg = pic1 if pic1 and pic1.exists() else pic0 if pic0 and pic0.exists() else None
+                    fg = pic0 if pic1 and pic1.exists() and pic0 and pic0.exists() else None
+                    index[gid] = {"path": e.path, "format": "ZAR", "icon": icon if icon and icon.exists() else None,
+                                  "bg": bg, "fg": fg, "titleId": metadata.get("titleId"), "version": metadata.get("version")}
+                    found.append({"id": gid, "title": metadata.get("title") or Path(e.name).stem,
+                                  "titleId": metadata.get("titleId"), "path": e.path, "format": "ZAR",
+                                  "icon": bool(icon and icon.exists()), "bg": bool(bg), "fg": bool(fg),
+                                  "version": metadata.get("version")})
     with lock:
         game_index.clear()
         game_index.update(index)
         for g in found:
             st = config["games"].get(g["id"], {})
-            us = user_stats(g["id"], active_user())
+            us = user_stats(g["id"], active_user(), g.get("titleId"))
             g.update(fork=st.get("fork"), lastPlayed=us.get("lastPlayed"), playTime=us.get("playTime", 0), plays=us.get("plays", 0),
                      overrides=st.get("overrides", {}))
     found.sort(key=lambda g: (-(g["lastPlayed"] or 0), g["title"].lower()))
@@ -752,12 +956,12 @@ def launch(game_id, fork_id):
         proc = subprocess.Popen(args, cwd=str(vdir), env=fork_env(vdir, fs["env"]), stdout=lf, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL)
     run = {"id": secrets.token_hex(4), "proc": proc, "game": game_id, "fork": fork["id"], "tag": meta["tag"],
-           "started": time.time(), "log": str(log), "uid": active_user()["uid"]}
+           "started": time.time(), "log": str(log), "uid": active_user()["uid"], "titleId": g.get("titleId")}
     with lock:
         running[run["id"]] = run
-        us = dict(user_stats(game_id, active_user()))
+        us = dict(user_stats(game_id, active_user(), g.get("titleId")))
         us.update(lastPlayed=time.time(), plays=us.get("plays", 0) + 1)
-        st.setdefault("byUser", {})[str(active_user()["uid"])] = us
+        record_user_stats(game_id, g.get("titleId"), active_user()["uid"], us)
         st["fork"] = fork["id"]
         save_config()
     threading.Thread(target=watch_run, args=(run,), daemon=True).start()
@@ -855,9 +1059,9 @@ def watch_run(run):
         run["ended"] = time.time()
         st = config["games"].setdefault(run["game"], {})
         who = get_user_by_uid(run.get("uid"))
-        us = dict(user_stats(run["game"], who)) if who else {}
+        us = dict(user_stats(run["game"], who, run.get("titleId"))) if who else {}
         us["playTime"] = us.get("playTime", 0) + int(run["ended"] - run["started"])
-        st.setdefault("byUser", {})[str(run.get("uid"))] = us
+        record_user_stats(run["game"], run.get("titleId"), run.get("uid"), us)
         save_config()
     ui_restore()
 
@@ -880,15 +1084,51 @@ def active_user():
     return get_user(config["activeUser"]) or config["users"][0]
 
 
-def user_stats(game_id, user):
+def stats_title_key(title_id):
+    return str(title_id or "").strip().upper()
+
+
+def record_user_stats(game_id, title_id, uid, stats):
+    by_user = config["games"].setdefault(game_id, {}).setdefault("byUser", {})
+    by_user[str(uid)] = dict(stats)
+    title_key = stats_title_key(title_id)
+    if title_key:
+        config.setdefault("titleStats", {}).setdefault(title_key, {})[str(uid)] = dict(stats)
+
+
+def promote_game_stats(game_id, title_id):
+    title_key = stats_title_key(title_id)
+    if not title_key:
+        return
+    old = config["games"].get(game_id, {})
+    dest = config.setdefault("titleStats", {}).setdefault(title_key, {})
+    for uid, stats in old.get("byUser", {}).items():
+        dest.setdefault(str(uid), dict(stats))
+    if "byUser" not in old and old.get("lastPlayed"):
+        first = min(config["users"], key=lambda user: user["created"])
+        dest.setdefault(str(first["uid"]), {"lastPlayed": old.get("lastPlayed"),
+                                            "playTime": old.get("playTime", 0), "plays": old.get("plays", 0)})
+
+
+def user_stats(game_id, user, title_id=None):
     """Per-user play statistics; the pre-users totals belong to the first (original) user."""
+    title_key = stats_title_key(title_id)
+    if title_key:
+        title_stats = config.setdefault("titleStats", {}).get(title_key, {}).get(str(user["uid"]))
+        if title_stats is not None:
+            return title_stats
     st = config["games"].get(game_id, {})
     bu = st.get("byUser", {}).get(str(user["uid"]))
     if bu is not None:
+        if title_key:
+            config.setdefault("titleStats", {}).setdefault(title_key, {})[str(user["uid"])] = dict(bu)
         return bu
     first = min(config["users"], key=lambda u: u["created"])
     if user["id"] == first["id"] and "byUser" not in st:
-        return {"lastPlayed": st.get("lastPlayed"), "playTime": st.get("playTime", 0), "plays": st.get("plays", 0)}
+        legacy = {"lastPlayed": st.get("lastPlayed"), "playTime": st.get("playTime", 0), "plays": st.get("plays", 0)}
+        if title_key and legacy.get("lastPlayed"):
+            config.setdefault("titleStats", {}).setdefault(title_key, {})[str(user["uid"])] = dict(legacy)
+        return legacy
     return {}
 
 
@@ -909,6 +1149,11 @@ def data_dir(fork):
     return FORKS_DIR / fork["id"] / "_data"
 
 
+def shared_user_data_dir():
+    """Save data and trophies shared by every emulator fork, partitioned by Kyty user IDs."""
+    return DATA / "shared-user-data"
+
+
 def is_link(p):
     p = str(p)
     return os.path.islink(p) or (hasattr(os.path, "isjunction") and os.path.isjunction(p))
@@ -921,6 +1166,35 @@ def make_junction(link, target):
     except Exception:
         subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True,
                        creationflags=0x08000000)
+
+
+def remove_directory_link(path):
+    if os.path.islink(path):
+        Path(path).unlink()
+    else:  # Windows junction
+        os.rmdir(path)
+
+
+def ensure_data_link(link, target, fork_id):
+    link, target = Path(link), Path(target)
+    target.mkdir(parents=True, exist_ok=True)
+    if is_link(link):
+        try:
+            if link.resolve() == target.resolve():
+                return
+            src = link.resolve()
+        except OSError:
+            src = link
+        if src.is_dir():
+            merge_copy(src, target, fork_id, "newer")
+        remove_directory_link(link)
+    elif link.is_dir():
+        merge_copy(link, target, fork_id, "newer")
+        shutil.rmtree(link)
+    elif link.exists():
+        link.unlink()
+    link.parent.mkdir(parents=True, exist_ok=True)
+    make_junction(link, target)
 
 
 def merge_copy(src, dst, fork_id="misc", prefer="dst"):
@@ -969,21 +1243,24 @@ def merge_copy(src, dst, fork_id="misc", prefer="dst"):
 
 
 def ensure_links(fork, vdir):
-    """Keep saves/trophies/DLC outside the version folder so updates never touch them."""
-    base = data_dir(fork)
-    for name in PERSIST:
-        target, link = base / name, Path(vdir) / name
-        target.mkdir(parents=True, exist_ok=True)
-        if is_link(link):
-            continue
-        if link.is_dir():
-            merge_copy(link, target, fork["id"], "dst")  # adopt what the emulator wrote before the links existed
-            shutil.rmtree(link)
-        elif link.exists():
-            link.unlink()
-        make_junction(link, target)
+    """Share saves/trophies across forks; keep pipeline caches fork-specific."""
+    with lock:
+        base = data_dir(fork)
+        shared = shared_user_data_dir()
+        ensure_shared_fork_data(fork)
+        for name in SAVE_DIRS:
+            ensure_data_link(Path(vdir) / name, shared / name, fork["id"])
+        name = "_PipelineCache"
+        (base / name).mkdir(parents=True, exist_ok=True)
+        ensure_data_link(Path(vdir) / name, base / name, fork["id"])
 
 
+def ensure_shared_fork_data(fork):
+    """Migrate this fork's legacy per-fork save data into the shared user store."""
+    with lock:
+        base, shared = data_dir(fork), shared_user_data_dir()
+        for name in SAVE_DIRS:
+            ensure_data_link(base / name, shared / name, fork["id"])
 
 
 # ------------------------------------------------------ in-game menu hotkey --
@@ -1471,6 +1748,172 @@ LEVEL_STEPS = [(1, 60), (100, 90), (200, 450), (300, 900), (400, 1350), (500, 18
                (800, 3150), (900, 3600)]
 ucp_cache = {}
 UCP_MAGIC = b"\xb2\x28\xc6\x0a"
+zar_trophy_attempts = {}
+ZAR_BLOCK_SIZE = 64 * 1024
+ZAR_ENTRIES_PER_RECORD = 16
+ZAR_FOOTER_SIZE = 144
+ZAR_REQUIRED_SUFFIXES = ("sce_sys/param.json", "sce_sys/icon0.png", "sce_sys/pic0.png",
+                         "sce_sys/pic1.png", "sce_sys/trophy2/trophy00.ucp")
+zar_index_cache = {}
+
+
+def zar_find_entry(archive, suffix):
+    """Return the virtual path and byte range for a file inside a ZAR."""
+    archive = Path(archive)
+    cache_key = str(archive.resolve()).casefold()
+    mtime = archive.stat().st_mtime_ns
+    cached = zar_index_cache.get(cache_key)
+    if cached and cached[0] == mtime:
+        return cached[1].get(suffix.casefold())
+    with open(archive, "rb") as f:
+        length = os.fstat(f.fileno()).st_size
+        if length < ZAR_FOOTER_SIZE:
+            raise ValueError("ZAR is too small to contain a footer")
+        f.seek(length - ZAR_FOOTER_SIZE)
+        footer = f.read(ZAR_FOOTER_SIZE)
+        if struct.unpack(">I", footer[136:140])[0] != 0x61BF3A01 or struct.unpack(">I", footer[140:144])[0] != 0x169F52D6:
+            raise ValueError("Invalid ZAR footer")
+        if struct.unpack(">Q", footer[128:136])[0] != length:
+            raise ValueError("ZAR size does not match its footer")
+        sections = struct.unpack(">12Q", footer[:96])
+        data_offset, data_size = sections[0:2]
+        records_offset, records_size = sections[2:4]
+        names_offset, names_size = sections[4:6]
+        tree_offset, tree_size = sections[6:8]
+        limit = length - ZAR_FOOTER_SIZE
+        for offset, size in ((data_offset, data_size), (records_offset, records_size),
+                             (names_offset, names_size), (tree_offset, tree_size)):
+            if offset + size > limit:
+                raise ValueError("ZAR section is outside the file")
+        if records_size % 40 or tree_size < 16 or tree_size % 16:
+            raise ValueError("Malformed ZAR index")
+        if names_size > 128 * 1024 * 1024 or tree_size > 512 * 1024 * 1024:
+            raise ValueError("ZAR index is too large to inspect safely")
+        f.seek(names_offset)
+        names = f.read(names_size)
+        f.seek(tree_offset)
+        tree = f.read(tree_size)
+
+    count = len(tree) // 16
+    wanted_suffixes = tuple(value.casefold() for value in ZAR_REQUIRED_SUFFIXES)
+    found = {}
+    stack, guard = [(0, "")], 0
+    while stack:
+        index, parent = stack.pop()
+        guard += 1
+        if guard > count + 1:
+            raise ValueError("ZAR directory tree contains a loop")
+        name_field, a, b, c = struct.unpack_from(">4I", tree, index * 16)
+        is_file = bool(name_field & 0x80000000)
+        if index == 0:
+            name, path = "", ""
+        else:
+            name_offset = name_field & 0x7FFFFFFF
+            if name_offset >= len(names):
+                raise ValueError("ZAR name points outside the name table")
+            size = names[name_offset]
+            start = name_offset + 1
+            if size & 0x80:
+                if start >= len(names):
+                    raise ValueError("Truncated ZAR filename")
+                size = (size & 0x7F) | (names[start] << 7)
+                start += 1
+            if start + size > len(names):
+                raise ValueError("Truncated ZAR filename")
+            name = names[start:start + size].decode("utf-8", "replace")
+            path = f"{parent}/{name}" if parent else name
+        if is_file:
+            folded = path.casefold()
+            if any(folded.endswith(wanted) for wanted in wanted_suffixes):
+                file_offset = a | ((c & 0xFFFF) << 32)
+                file_size = b | ((c & 0xFFFF0000) << 16)
+                entry = (path, file_offset, file_size, data_offset, data_size, records_offset, records_size)
+                for wanted in wanted_suffixes:
+                    if folded.endswith(wanted):
+                        found[wanted] = entry
+        else:
+            if a + b > count:
+                raise ValueError("ZAR directory range is invalid")
+            for child in range(a, a + b):
+                stack.append((child, path))
+    zar_index_cache[cache_key] = (mtime, found)
+    return found.get(suffix.casefold())
+
+
+def zar_extract_entry(archive, entry, output):
+    path, start, file_size, data_offset, data_size, records_offset, records_size = entry
+    if file_size > 128 * 1024 * 1024:
+        raise ValueError("Trophy pack exceeds the safe extraction limit")
+    try:
+        import zstandard
+    except ImportError as e:
+        raise RuntimeError("The ZAR reader dependency is missing; reinstall Kyty Studio") from e
+    decompressor = zstandard.ZstdDecompressor()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    position = start
+    remaining = file_size
+    try:
+        with open(archive, "rb") as src, open(temporary, "wb") as dst:
+            while remaining:
+                block = position // ZAR_BLOCK_SIZE
+                within = position % ZAR_BLOCK_SIZE
+                record = block // ZAR_ENTRIES_PER_RECORD
+                slot = block % ZAR_ENTRIES_PER_RECORD
+                record_pos = records_offset + record * 40
+                if record_pos + 40 > records_offset + records_size:
+                    raise ValueError("ZAR block index is out of range")
+                src.seek(record_pos)
+                rec = src.read(40)
+                base = struct.unpack_from(">Q", rec, 0)[0]
+                sizes = struct.unpack_from(">16H", rec, 8)
+                stored_offset = base + sum(value + 1 for value in sizes[:slot])
+                stored_size = sizes[slot] + 1
+                if stored_offset + stored_size > data_size:
+                    raise ValueError("ZAR data block is out of range")
+                src.seek(data_offset + stored_offset)
+                stored = src.read(stored_size)
+                if len(stored) != stored_size:
+                    raise ValueError("ZAR data block is truncated")
+                block_data = stored if stored_size == ZAR_BLOCK_SIZE else decompressor.decompress(
+                    stored, max_output_size=ZAR_BLOCK_SIZE)
+                if len(block_data) != ZAR_BLOCK_SIZE:
+                    raise ValueError("ZAR block decompressed to an invalid size")
+                take = min(remaining, ZAR_BLOCK_SIZE - within)
+                dst.write(block_data[within:within + take])
+                remaining -= take
+                position += take
+        temporary.replace(output)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def cached_zar_file(archive, virtual_path, output, max_size):
+    output = Path(output)
+    if output.is_file():
+        return output
+    entry = zar_find_entry(archive, virtual_path)
+    if not entry:
+        return None
+    if entry[2] > max_size:
+        raise ValueError(f"{virtual_path} exceeds the safe extraction limit")
+    zar_extract_entry(archive, entry, output)
+    return output
+
+
+def cached_zar_trophy(archive):
+    sidecar_path = zar_sidecar(archive) / "trophy" / "trophy00.ucp"
+    if sidecar_path.is_file():
+        return sidecar_path
+    archive = Path(archive)
+    mtime = archive.stat().st_mtime_ns
+    cache_key = str(archive.resolve()).casefold()
+    if zar_trophy_attempts.get(cache_key) == mtime:
+        return None
+    zar_trophy_attempts[cache_key] = mtime
+    return cached_zar_file(archive, "sce_sys/trophy2/trophy00.ucp", sidecar_path, 128 * 1024 * 1024)
+
 
 
 def ucp_open(path):
@@ -1510,7 +1953,7 @@ def pick_language(c, want, default):
 
 def earned_map(title_id, uid=None):
     """Unlock state written by any installed fork/version. Values are unix seconds."""
-    dirs = []
+    dirs = [shared_user_data_dir() / "_Trophies" / title_id]
     for f in config["forks"]:
         dirs.append(data_dir(f) / "_Trophies" / title_id)
         base = FORKS_DIR / f["id"]
@@ -1533,8 +1976,19 @@ def earned_map(title_id, uid=None):
 
 def trophy_pack_of(gid):
     g = game_index.get(gid)
-    p = g and Path(g["path"]) / "sce_sys" / "trophy2" / "trophy00.ucp"
-    return p if p and p.is_file() else None
+    if not g:
+        return None
+    path = Path(g["path"])
+    if g.get("format") == "ZAR":
+        source_dump = path.with_suffix("")
+        if (source_dump / "sce_sys" / "trophy2" / "trophy00.ucp").is_file():
+            return source_dump / "sce_sys" / "trophy2" / "trophy00.ucp"
+        try:
+            return cached_zar_trophy(path)
+        except (OSError, ValueError, RuntimeError, struct.error):
+            return None
+    p = path / "sce_sys" / "trophy2" / "trophy00.ucp"
+    return p if p.is_file() else None
 
 
 def trophy_level(points):
@@ -1642,6 +2096,7 @@ def state():
             "libraries": config["libraries"], "defaultFork": config["defaultFork"],
             "users": config["users"], "activeUser": config["activeUser"],
             "jobs": list(jobs.values()), "running": [public_run(r) for r in running.values()],
+            "zarJobs": list(zar_jobs.values()), "zarAvailable": bool(zarchive_tool()),
             "now": time.time(), "menuReq": menu_req,
         }
 
@@ -1656,6 +2111,99 @@ def pick_folder():
         return filedialog.askdirectory(title="Choose a folder")
     finally:
         root.destroy()
+
+
+# ---------------------------------------------------------------- plugins ---
+# Optional add-ons, installed by the user as DATA/plugins/<id>/ . Studio ships none and does not know what one does:
+# it only lists them, loads the ones that are enabled and gives them an API (see PLUGINS.md). A plugin is trusted
+# code: its script runs in the app window and its optional backend runs in this process with the user's permissions.
+
+PLUGIN_ID = re.compile(r"^[a-z][a-z0-9-]{1,47}$")
+PLUGIN_ASSET = re.compile(r"^[\w.-]+\.(js|css|png|jpg|jpeg|svg|webp|woff2|json)$", re.I)
+plugin_routes = {}  # (plugin id, route name) -> callable
+plugin_errors = {}
+
+
+def plugin_log(pid, *parts):
+    """DATA/logs/plugin-<id>.log: what a plugin logged, its backend errors and its script errors."""
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  " + " ".join(str(p) for p in parts)
+    print(f"[plugin {pid}]", *parts, flush=True)
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        log = LOGS_DIR / f"plugin-{pid}.log"
+        if log.exists() and log.stat().st_size > 1_000_000:  # keep one older copy, never grow without bound
+            os.replace(log, log.with_suffix(".old.log"))
+        with open(log, "a", encoding="utf-8", errors="replace") as f:
+            f.write(line.rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def plugin_manifests():
+    out = []
+    if not PLUGINS_DIR.is_dir():
+        return out
+    for folder in sorted(PLUGINS_DIR.iterdir()):
+        if not folder.is_dir() or not PLUGIN_ID.match(folder.name):
+            continue
+        try:
+            m = json.loads((folder / "plugin.json").read_text("utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(m, dict) or m.get("id") != folder.name:
+            continue
+
+        def part(key, ext):
+            v = m.get(key)
+            return v if isinstance(v, str) and re.fullmatch(rf"[\w.-]+\.{ext}", v) and (folder / v).is_file() else None
+        out.append({"id": folder.name, "name": _text(m.get("name") or folder.name, 60), "version": _text(m.get("version"), 20),
+                    "author": _text(m.get("author"), 60), "description": _text(m.get("description"), 300),
+                    "script": part("script", "js"), "styles": part("styles", "css"), "backend": part("backend", "py"),
+                    "enabled": folder.name not in config.get("pluginsDisabled", [])})
+    return out
+
+
+class PluginHost:
+    """What a plugin backend gets (as the name `studio`) instead of Studio's internals."""
+
+    def __init__(self, pid):
+        self.id = pid
+        self.data_dir = PLUGIN_DATA_DIR / pid  # the plugin's own folder; created on first use
+
+    def route(self, name, fn=None):
+        """Expose fn(body: dict) -> JSON-able at /api/plugins/<id>/<name>; usable as a decorator."""
+        if not re.fullmatch(r"[a-z0-9-]{1,40}", name):
+            raise ValueError("route names are 1-40 characters of a-z, 0-9 and -")
+
+        def register(f):
+            plugin_routes[(self.id, name)] = f
+            return f
+        return register(fn) if fn else register
+
+    def load(self, default=None):
+        return read_json(self.data_dir / "state.json") or default
+
+    def save(self, obj):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "state.json").write_text(json.dumps(obj), "utf-8")
+
+    def log(self, *a):
+        plugin_log(self.id, *a)
+
+
+def load_plugin_backends():
+    for p in plugin_manifests():
+        if not p["enabled"] or not p["backend"]:
+            continue
+        src = PLUGINS_DIR / p["id"] / p["backend"]
+        try:
+            ns = {"__name__": "studio_plugin_" + p["id"].replace("-", "_"), "studio": PluginHost(p["id"])}
+            exec(compile(src.read_text("utf-8-sig"), str(src), "exec"), ns)
+        except Exception as e:  # a broken add-on must never stop Studio
+            plugin_errors[p["id"]] = f"{e.__class__.__name__}: {e}"
+            plugin_log(p["id"], "backend failed to load:\n" + traceback.format_exc())
+            for k in [k for k in plugin_routes if k[0] == p["id"]]:
+                del plugin_routes[k]
 
 
 # ------------------------------------------------------------------- HTTP --
@@ -1752,7 +2300,47 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json({"error": f"{e.__class__.__name__}: {e}"}, 500)
 
+    def plugin_api(self, method, path, q, body):
+        parts = path.split("/")  # ["", "api", "plugins", ...]
+        manifests = {p["id"]: p for p in plugin_manifests()}
+        if len(parts) == 3:
+            if method != "GET":
+                raise ValueError("Unknown endpoint")
+            return self.send_json({"plugins": [{**p, "error": plugin_errors.get(p["id"])} for p in manifests.values()], "dir": str(PLUGINS_DIR)})
+        if parts[3] == "log" and method == "POST":  # script errors reported by the app window
+            if str(body.get("id")) in manifests:
+                plugin_log(str(body["id"]), "script:", str(body.get("text", ""))[:2000])
+            return self.send_json({"ok": True})
+        if parts[3] == "enable" and method == "POST":
+            p = manifests.get(str(body.get("id")))
+            if not p:
+                raise ValueError("Unknown plugin")
+            off = [i for i in config.get("pluginsDisabled", []) if i != p["id"]]
+            if not body.get("enabled"):
+                off.append(p["id"])
+            config["pluginsDisabled"] = off
+            save_config()
+            return self.send_json({"ok": True, "restart": True})
+        if parts[3] == "ui" and method == "GET" and len(parts) == 6:
+            p = manifests.get(parts[4])
+            f = (PLUGINS_DIR / parts[4] / parts[5]).resolve() if p and p["enabled"] and PLUGIN_ASSET.match(parts[5]) else None
+            if not f or f.parent != (PLUGINS_DIR / parts[4]).resolve() or not f.is_file():
+                return self.send_json({"error": "not found"}, 404)
+            return self.send_file(f)
+        if len(parts) == 5 and PLUGIN_ID.match(parts[3]):
+            fn = plugin_routes.get((parts[3], parts[4])) if manifests.get(parts[3], {}).get("enabled") else None
+            if not fn:
+                return self.send_json({"error": "unknown plugin route"}, 404)
+            try:
+                return self.send_json(fn(body if method == "POST" else {k: v[0] for k, v in q.items() if k != "t"}))
+            except Exception:
+                plugin_log(parts[3], f"route {parts[4]} failed:\n" + traceback.format_exc())
+                raise
+        raise ValueError("Unknown endpoint")
+
     def dispatch(self, method, path, q, body):
+        if path.startswith("/api/plugins"):
+            return self.plugin_api(method, path, q, body)
         if method == "GET":
             if path == "/api/state":
                 return self.send_json(state())
@@ -1842,6 +2430,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Built-in forks cannot be removed")
                 if any(r["fork"] == fork["id"] and r["proc"].poll() is None for r in running.values()):
                     raise ValueError("A game is running on this fork")
+                ensure_shared_fork_data(fork)
                 for m in installed_versions(fork):
                     rm_version(version_dir(fork, m["tag"]))
                 keep = data_dir(fork)
@@ -1948,6 +2537,8 @@ class Handler(BaseHTTPRequestHandler):
                         config["settings"][k] = v
                 save_config()
                 return self.send_json(state())
+            if path == "/api/game/convert-zar":
+                return self.send_json(start_zar_conversion(str(body.get("game") or ""), bool(body.get("deleteSource"))))
             if path == "/api/library/add":
                 p = body.get("path") or pick_folder()
                 if p and Path(p).is_dir():
@@ -2062,7 +2653,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/shaders/clear":
                 scan_games()
                 return self.send_json({"removed": clear_shader_cache(body["game"])})
-            if path == "/api/import":  # copy saves/trophies/DLC from another KytyPS5 folder into a fork's data
+            if path == "/api/import":  # merge user data into the shared store and cache into this fork
                 fork = get_fork(body["fork"])
                 if not fork:
                     raise ValueError("Unknown fork")
@@ -2073,7 +2664,8 @@ class Handler(BaseHTTPRequestHandler):
                 copied = []
                 for name in PERSIST:
                     if (src / name).is_dir():
-                        merge_copy(src / name, data_dir(fork) / name, fork["id"], "newer")
+                        target = shared_user_data_dir() / name if name in SAVE_DIRS else data_dir(fork) / name
+                        merge_copy(src / name, target, fork["id"], "newer")
                         copied.append(name)
                 if not copied:
                     raise ValueError("No _SaveData, _Trophies, _DownloadData or _PipelineCache folder found there")
@@ -2086,8 +2678,8 @@ class Handler(BaseHTTPRequestHandler):
                     meta = current_meta(get_fork(body["fork"]))
                     target = meta and str(version_dir(get_fork(body["fork"]), meta["tag"]))
                 elif "dataFork" in body and get_fork(body["dataFork"]):
-                    data_dir(get_fork(body["dataFork"])).mkdir(parents=True, exist_ok=True)
-                    target = str(data_dir(get_fork(body["dataFork"])))
+                    shared_user_data_dir().mkdir(parents=True, exist_ok=True)
+                    target = str(shared_user_data_dir())
                 elif body.get("what") == "community":
                     (COMMUNITY_DIR / "patches").mkdir(parents=True, exist_ok=True)
                     if not CATALOG_FILE.exists():  # a skeleton to edit
@@ -2096,6 +2688,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif body.get("what") == "logs":
                     LOGS_DIR.mkdir(exist_ok=True)
                     target = str(LOGS_DIR)
+                elif body.get("what") == "plugins":
+                    PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+                    target = str(PLUGINS_DIR)
                 if not target or not os.path.exists(target):
                     raise ValueError("Nothing to open")
                 os.startfile(os.path.dirname(target) if os.path.isfile(target) else target)
@@ -2130,6 +2725,7 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(TMP_DIR, ignore_errors=True)
     TMP_DIR.mkdir(exist_ok=True)
+    load_plugin_backends()
     cached = read_json(DATA / "release-cache.json")
     if isinstance(cached, dict):  # last known releases (and ETags) from the previous session
         for repo, ent in cached.items():

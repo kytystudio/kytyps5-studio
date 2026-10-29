@@ -1,8 +1,11 @@
 THIRD-PARTY SOFTWARE INCLUDED IN KYTYPS5 STUDIO
 =================================================
-KytyPS5 Studio is bundled with the components below (Python runtime and libraries).
+KytyPS5 Studio is bundled with the components below (Python runtime, libraries, ZArchive-Next and zstandard).
 Each is used under its own license; the license texts follow. The Microsoft Edge WebView2 runtime is NOT
 bundled: it is a Windows component installed separately by Microsoft.
+
+zstandard 0.25.0 reads individual files inside a ZArchive without unpacking the whole game. It is licensed
+under the BSD 3-Clause License; see licenses/zstandard-LICENSE.txt.
 
 
 ==============================================================================
@@ -183,6 +186,28 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+==============================================================================
+ZArchive-Next 0.1  --  MIT No Attribution (based on ZArchive by Exzap)
+Source: https://github.com/Mario-119/ZArchive-Next
+==============================================================================
+MIT No Attribution
+
+Copyright 2022 Exzap
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this
+software and associated documentation files (the "Software"), to deal in the Software
+without restriction, including without limitation the rights to use, copy, modify,
+merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 ==============================================================================

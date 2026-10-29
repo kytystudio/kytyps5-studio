@@ -1,0 +1,10 @@
+{
+  "id": "hello",
+  "name": "Hello example",
+  "version": "1.0.0",
+  "author": "KytyPS5 Studio",
+  "description": "A minimal add-on: one tab, one settings section and one backend route.",
+  "script": "hello.js",
+  "styles": "hello.css",
+  "backend": "backend.py"
+}
