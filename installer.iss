@@ -2,7 +2,7 @@
 [Setup]
 AppId={{6B1D2A52-6C0E-4C6B-9B0C-4B5A1E7D2F10}
 AppName=KytyPS5 Studio
-AppVersion=1.1.0
+AppVersion=1.2.0
 AppPublisher=KytyPS5 Studio
 DefaultDirName={autopf}\KytyPS5 Studio
 DefaultGroupName=KytyPS5 Studio
