@@ -46,9 +46,52 @@ if (-not (Test-Path -LiteralPath $zarExe -PathType Leaf)) {
   }
 }
 
+# Packwright extracts downloaded game packages (used by the Downloads plugin through studio.tool()).
+# Its self-contained Windows runtime is installed into an isolated staging folder,
+# copied into the PyInstaller bundle as tools\packwright, then uninstalled again.
+$packwrightVersion = "1.1.0"
+$packwrightCache = Join-Path $env:TEMP "kyty-studio-packwright-$packwrightVersion"
+$packwrightDir = Join-Path $packwrightCache "runtime"
+$packwrightExe = Join-Path $packwrightDir "Packwright.exe"
+$packwrightSource = Join-Path $packwrightCache "Packwright-source-v$packwrightVersion.zip"
+$packwrightInstallerName = "Packwright-Setup-v$packwrightVersion-windows-x64.exe"
+$packwrightInstaller = Join-Path $packwrightCache $packwrightInstallerName
+$packwrightInstallerSha256 = "8368CEE69079DC32A6E66767EC940716319383D867E1EB67CC6F40000685F4E4"
+if (-not (Test-Path -LiteralPath $packwrightExe -PathType Leaf)) {
+  New-Item -ItemType Directory -Force -Path $packwrightCache | Out-Null
+  if (-not (Test-Path -LiteralPath $packwrightInstaller -PathType Leaf)) {
+    $url = "https://github.com/itsmemac/Packwright/releases/download/v$packwrightVersion/$packwrightInstallerName"
+    Invoke-WebRequest -Uri $url -OutFile $packwrightInstaller -Headers @{ "User-Agent" = "KytyPS5Studio-Build" }
+  }
+  $installerHash = (Get-FileHash -LiteralPath $packwrightInstaller -Algorithm SHA256).Hash
+  if ($installerHash -ne $packwrightInstallerSha256) {
+    Remove-Item -LiteralPath $packwrightInstaller -Force
+    throw "Packwright installer SHA-256 did not match the pinned release digest."
+  }
+  $staging = Join-Path $packwrightCache "staging"
+  if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+  $install = Start-Process -FilePath $packwrightInstaller -ArgumentList @(
+    "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/NOICONS", "/DIR=`"$staging`""
+  ) -Wait -PassThru -WindowStyle Hidden
+  if ($install.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $staging "Packwright.exe"))) {
+    throw "Packwright $packwrightVersion could not be staged (installer exit $($install.ExitCode))."
+  }
+  New-Item -ItemType Directory -Force -Path $packwrightDir | Out-Null
+  Get-ChildItem -LiteralPath $staging -Force | Where-Object { $_.Name -notmatch '^unins\d*\.' } |
+    Copy-Item -Destination $packwrightDir -Recurse -Force
+  $uninstaller = Get-ChildItem -LiteralPath $staging -Filter "unins*.exe" -File | Select-Object -First 1
+  if ($uninstaller) { Start-Process -FilePath $uninstaller.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES" -Wait -WindowStyle Hidden }
+  if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+}
+# Packwright is GPL-3: ship its source archive next to the binaries.
+if (-not (Test-Path -LiteralPath $packwrightSource -PathType Leaf)) {
+  $sourceUrl = "https://codeload.github.com/itsmemac/Packwright/zip/refs/tags/v$packwrightVersion"
+  Invoke-WebRequest -Uri $sourceUrl -OutFile $packwrightSource -Headers @{ "User-Agent" = "KytyPS5Studio-Build" }
+}
+
 python -m PyInstaller --noconfirm --clean --windowed --name KytyPS5Studio --icon "$here\icon.ico" `
-  --add-data "$here\ui;ui" --add-data "$here\icon.ico;." `
-  --add-data "$here\licenses\zstandard-LICENSE.txt;licenses" --add-binary "$zarExe;tools" `
+  --add-data "$here\ui;ui" --add-data "$here\icon.ico;." --add-data "$packwrightDir;tools\packwright" `
+  --add-data "$packwrightSource;." --add-data "$here\licenses\zstandard-LICENSE.txt;licenses" --add-binary "$zarExe;tools" `
   --distpath $OutputDir --workpath "$env:TEMP\kyty_build" --specpath "$env:TEMP\kyty_build" "$here\studio.py"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE." }
 $appDir = Join-Path $OutputDir "KytyPS5Studio"

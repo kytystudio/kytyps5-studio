@@ -1,6 +1,9 @@
 # user data: saves, trophies, downloaded emulators, logs, settings, community files
 data/
-# build output
+# promo material (videos, captures and their tooling), kept locally only
+promo/
+# build output, and bundled tools copied in for running from source
+tools/
 dist/
 installer/
 build/

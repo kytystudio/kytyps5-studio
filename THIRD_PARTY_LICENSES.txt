@@ -1,8 +1,13 @@
 THIRD-PARTY SOFTWARE INCLUDED IN KYTYPS5 STUDIO
 =================================================
-KytyPS5 Studio is bundled with the components below (Python runtime, libraries, ZArchive-Next and zstandard).
+KytyPS5 Studio is bundled with the components below (Python runtime, libraries, ZArchive-Next, Packwright and zstandard).
 Each is used under its own license; the license texts follow. The Microsoft Edge WebView2 runtime is NOT
 bundled: it is a Windows component installed separately by Microsoft.
+
+Packwright 1.1.0 is included to extract downloaded game packages. It is licensed under GNU GPL version 3.
+The full license text and third-party notices are shipped in tools/packwright/LICENSE and
+tools/packwright/licenses/. The Packwright v1.1.0 source archive is shipped in the installation folder.
+Project and source: https://github.com/itsmemac/Packwright
 
 zstandard 0.25.0 reads individual files inside a ZArchive without unpacking the whole game. It is licensed
 under the BSD 3-Clause License; see licenses/zstandard-LICENSE.txt.
