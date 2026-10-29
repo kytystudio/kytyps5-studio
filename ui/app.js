@@ -1103,7 +1103,17 @@ function viewSettings() {
         try { await api("/api/plugins/enable", { id: p.id, enabled: !p.enabled }); p.enabled = !p.enabled; sw.classList.toggle("on", p.enabled); toast(p.name, "Restart Studio to apply"); } catch (e) { fail(e); }
       } } }, label(p.name + (p.version ? "  " + p.version : ""), [p.description, p.author && "by " + p.author, p.error && "Error: " + p.error].filter(Boolean).join(" · ") || p.id), sw);
     }),
-    ...(pluginList.length ? [] : [pluginRow({ label: "No add-ons installed", desc: "Put an add-on folder (with a plugin.json) into the folder below and restart Studio." })]),
+    ...(pluginList.length ? [] : [pluginRow({ label: "No add-ons installed", desc: "Install an add-on .zip below, or put an add-on folder or .zip into the add-ons folder and restart Studio." })]),
+    action("Install add-on from .zip", "Installs or updates an add-on. Restart Studio to load it.", async () => {
+      try {
+        const r = await api("/api/plugins/install", {});
+        if (r.cancelled) return;
+        toast("Add-on installed", `${r.id} · restart Studio to load it`);
+        const loaded = new Map(pluginList.map(p => [p.id, p]));
+        pluginList = (await api("/api/plugins")).plugins.map(p => ({ ...p, error: loaded.get(p.id)?.error || p.error }));
+        fill(true);
+      } catch (e) { fail(e); }
+    }),
     action("Open add-ons folder", pluginDir, () => api("/api/open", { what: "plugins" }).catch(fail)),
     action("Open logs folder", "Each add-on writes plugin-<id>.log here", () => api("/api/open", { what: "logs" }).catch(fail))];
   const commRows = () => {

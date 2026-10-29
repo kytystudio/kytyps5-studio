@@ -6,9 +6,19 @@ permissions. Install only add-ons you trust and can read.
 
 ## Installing
 
-Put the add-on's folder into `%LOCALAPPDATA%\KytyPS5Studio\plugins\<id>\` (Settings > Plugins > *Open add-ons folder*)
-and restart Studio. Each add-on can be switched off in Settings > Plugins (applied after a restart). A broken add-on is
-reported there and never stops Studio.
+Use Settings > Plugins > *Install add-on from .zip*, or drop the `.zip` into the add-ons folder (Settings > Plugins >
+*Open add-ons folder*). Either way, restart Studio to load it. A dropped `.zip` is installed at start-up and moved to
+`plugins\.installed\`. Installing a newer `.zip` of the same id replaces the old code; the add-on's saved data in
+`plugin-data\<id>\` is kept. You can still copy an add-on folder to `plugins\<id>\` by hand.
+
+Each add-on can be switched off in Settings > Plugins (applied after a restart). A broken add-on is reported there
+and never stops Studio.
+
+### Packaging an add-on as .zip
+
+Zip the add-on's files with `plugin.json` at the root of the zip (or inside one top-level folder). Include only what
+the add-on needs at run time. Paths with `..`, drive letters and `__pycache__` folders are rejected or skipped, and the
+unpacked size is limited to 512 MB.
 
 ## Layout
 

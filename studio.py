@@ -2268,6 +2268,93 @@ class PluginHost:
                     pass
 
 
+PLUGIN_ZIP_MAX = 512 * 1024 * 1024  # uncompressed bytes; a plugin is code and assets, not game data
+
+
+def install_plugin_zip(src):
+    """Install a plugin .zip as DATA/plugins/<id>/, replacing an older copy; returns the id.
+
+    plugin.json may sit at the root of the zip or inside one top-level folder. The plugin's saved
+    data lives in DATA/plugin-data/<id>/ and is left untouched. Backends load at startup, so a
+    restart is needed before the new code runs.
+    """
+    with zipfile.ZipFile(src) as z:
+        files = [i for i in z.infolist() if not i.is_dir()]
+        manifests = [i.filename for i in files if i.filename.rsplit("/", 1)[-1] == "plugin.json"]
+        manifests = [n for n in manifests if n.count("/") <= 1]
+        if not manifests:
+            raise ValueError("The .zip has no plugin.json at its root or in one top-level folder")
+        manifest = min(manifests, key=lambda n: n.count("/"))
+        prefix = manifest[:-len("plugin.json")]
+        try:
+            m = json.loads(z.read(manifest).decode("utf-8-sig"))
+        except ValueError:
+            raise ValueError("plugin.json in the .zip is not valid JSON")
+        pid = m.get("id") if isinstance(m, dict) else None
+        if not isinstance(pid, str) or not PLUGIN_ID.match(pid):
+            raise ValueError("plugin.json needs an id of 2-48 lowercase letters, digits or -")
+        members = [i for i in files if i.filename.startswith(prefix)]
+        if sum(i.file_size for i in members) > PLUGIN_ZIP_MAX:
+            raise ValueError("The plugin is too large to install")
+        PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+        staging = PLUGINS_DIR / f".installing-{pid}-{secrets.token_hex(4)}"
+        staging.mkdir()
+        try:
+            for i in members:
+                parts = i.filename[len(prefix):].replace("\\", "/").split("/")
+                if any(p in ("", ".", "..") or ":" in p for p in parts):
+                    raise ValueError(f"Unsafe path in the .zip: {i.filename}")
+                if "__pycache__" in parts:
+                    continue
+                dest = staging.joinpath(*parts)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(i) as r, open(dest, "wb") as w:
+                    shutil.copyfileobj(r, w)
+            target = PLUGINS_DIR / pid
+            old = PLUGINS_DIR / f".old-{pid}-{secrets.token_hex(4)}" if target.exists() else None
+            if old:
+                os.replace(target, old)
+            try:
+                os.replace(staging, target)
+            except OSError:
+                if old:
+                    os.replace(old, target)
+                raise
+            if old:
+                shutil.rmtree(old, ignore_errors=True)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+    plugin_errors.pop(pid, None)
+    return pid
+
+
+def install_dropped_plugin_zips():
+    """Install any .zip left in the add-ons folder, then move it to .installed/ so it runs once."""
+    if not PLUGINS_DIR.is_dir():
+        return
+    for src in sorted(PLUGINS_DIR.glob("*.zip")):
+        try:
+            pid = install_plugin_zip(src)
+            done = PLUGINS_DIR / ".installed"
+            done.mkdir(exist_ok=True)
+            os.replace(src, done / src.name)
+            plugin_log(pid, f"installed from {src.name}")
+        except (OSError, ValueError, zipfile.BadZipFile) as e:
+            plugin_log("install", f"{src.name}: {e}")
+
+
+def pick_plugin_zip():
+    import tkinter
+    from tkinter import filedialog
+    root = tkinter.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        return filedialog.askopenfilename(title="Choose an add-on (.zip)", filetypes=[("Add-on", "*.zip")])
+    finally:
+        root.destroy()
+
+
 def load_plugin_backends():
     for p in plugin_manifests():
         if not p["enabled"] or not p["backend"]:
@@ -2388,6 +2475,16 @@ class Handler(BaseHTTPRequestHandler):
             if str(body.get("id")) in manifests:
                 plugin_log(str(body["id"]), "script:", str(body.get("text", ""))[:2000])
             return self.send_json({"ok": True})
+        if parts[3] == "install" and method == "POST" and len(parts) == 4:
+            src = pick_plugin_zip()
+            if not src:
+                return self.send_json({"cancelled": True})
+            try:
+                pid = install_plugin_zip(src)
+            except zipfile.BadZipFile:
+                raise ValueError("That file is not a valid .zip")
+            plugin_log(pid, f"installed from {Path(src).name}")
+            return self.send_json({"ok": True, "id": pid, "restart": True})
         if parts[3] == "enable" and method == "POST":
             p = manifests.get(str(body.get("id")))
             if not p:
@@ -2802,6 +2899,7 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(TMP_DIR, ignore_errors=True)
     TMP_DIR.mkdir(exist_ok=True)
+    install_dropped_plugin_zips()
     load_plugin_backends()
     cached = read_json(DATA / "release-cache.json")
     if isinstance(cached, dict):  # last known releases (and ETags) from the previous session
